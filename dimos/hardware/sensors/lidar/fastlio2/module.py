@@ -15,8 +15,8 @@
 """Python NativeModule wrapper for the FAST-LIO2 + Livox Mid-360 binary.
 
 Binds Livox SDK2 into FAST-LIO-NON-ROS for real-time LiDAR SLAM; outputs
-sensor/body-frame point clouds (register via the odometry pose) and odometry
-with covariance.
+sensor/body-frame point clouds, optional fixed-frame registered point clouds,
+and odometry with covariance.
 
 FAST-LIO tuning lives directly on ``FastLio2Config`` and is passed to the C++
 binary as plain CLI args (no YAML).
@@ -72,7 +72,8 @@ class FastLio2Config(NativeModuleConfig):
     frequency: float = 10.0
 
     # Odometry is published as frame_id (fixed) -> sensor_frame_id (moving sensor),
-    # and also broadcast on TF. The point cloud is stamped with sensor_frame_id
+    # and also broadcast on TF. `lidar` is stamped with sensor_frame_id; optional
+    # `registered_scan` is stamped with frame_id.
     frame_id: str = FRAME_ODOM
     sensor_frame_id: str = "mid360_link"
 
@@ -113,8 +114,9 @@ class FastLio2Config(NativeModuleConfig):
         default_factory=lambda: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
     )
     # publish behaviour (passed to the binary as CLI args, not the YAML)
-    scan_publish_en: bool = True  # false closes the lidar output
-    dense_publish_en: bool = True  # false voxel-downsamples the published cloud
+    scan_publish_en: bool = True  # false closes the sensor/body-frame lidar output
+    registered_scan_publish_en: bool = False  # true publishes the fixed-frame registered output
+    dense_publish_en: bool = True  # false publishes FAST-LIO's IESKF-downsampled scan
 
     # SDK port configuration (see livox/ports.py for defaults)
     cmd_data_port: int = SDK_CMD_DATA_PORT
@@ -133,6 +135,7 @@ class FastLio2(NativeModule, perception.Lidar, perception.Odometry):
     config: FastLio2Config
 
     lidar: Out[PointCloud2]
+    registered_scan: Out[PointCloud2]
     odometry: Out[Odometry]
 
     @rpc

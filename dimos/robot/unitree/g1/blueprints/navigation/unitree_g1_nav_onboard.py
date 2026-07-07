@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import os
+
 from dimos.core.coordination.blueprints import autoconnect
 from dimos.core.global_config import global_config
 from dimos.hardware.sensors.lidar.fastlio2.module import FastLio2
@@ -31,6 +33,15 @@ from dimos.visualization.vis_module import vis_module
 unitree_g1_nav_onboard = (
     autoconnect(
         _unitree_g1_onboard,
+        # _unitree_g1_onboard already includes FastLio2. autoconnect de-duplicates
+        # modules by keeping the later blueprint, so this overrides that FastLio2
+        # config for nav without changing the primitive/onboard default.
+        FastLio2.blueprint(
+            host_ip=os.getenv("LIDAR_HOST_IP", "192.168.123.164"),
+            lidar_ip=os.getenv("LIDAR_IP", "192.168.123.120"),
+            scan_publish_en=False,
+            registered_scan_publish_en=True,
+        ),
         create_cmu_nav(
             planner="simple",
             vehicle_height=G1.height_clearance,
@@ -48,6 +59,9 @@ unitree_g1_nav_onboard = (
                 "publish_free_paths": False,
             },
             simple_planner={
+                # FastLio2 publishes odom -> mid360_link (no separate body/sensor alias).
+                "body_frame": "mid360_link",
+                "sensor_frame": "mid360_link",
                 "cell_size": 0.2,
                 "obstacle_height_threshold": 0.10,
                 "inflation_radius": 0.5,
@@ -71,8 +85,6 @@ unitree_g1_nav_onboard = (
     )
     .remappings(
         [
-            # FastLio2 outputs "lidar"; SmartNav modules expect "registered_scan"
-            (FastLio2, "lidar", "registered_scan"),
             # Planner owns way_point — disconnect MovementManager's click relay
             (MovementManager, "way_point", "_mgr_way_point_unused"),
         ]

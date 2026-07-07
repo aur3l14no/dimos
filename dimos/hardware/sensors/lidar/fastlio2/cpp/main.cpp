@@ -5,8 +5,8 @@
 //
 // Binds Livox SDK2 directly into FAST-LIO-NON-ROS: SDK callbacks feed
 // CustomMsg/Imu to FastLio, which performs EKF-LOAM SLAM.  Sensor/body-frame
-// point clouds and odometry are published on LCM (consumers register the cloud
-// via the odometry pose).
+// point clouds, optional fixed-frame registered point clouds, and odometry are
+// published on LCM.
 //
 // Usage:
 //   ./fastlio2_native \
@@ -57,6 +57,7 @@ static lcm::LCM* g_lcm = nullptr;
 static FastLio* g_fastlio = nullptr;
 
 static std::string g_lidar_topic;
+static std::string g_registered_scan_topic;
 static std::string g_odometry_topic;
 static std::string g_frame_id;  // required via --frame_id
 static std::string g_sensor_frame_id;  // required via --sensor_frame_id
@@ -296,6 +297,7 @@ static void run_main_iter(
     std::chrono::microseconds pc_interval,
     std::chrono::microseconds odom_interval,
     bool scan_publish_en,
+    bool registered_scan_publish_en,
     bool dense_publish_en
 ) {
     // At frame rate, drain accumulated raw points into a CustomMsg and feed
@@ -335,20 +337,36 @@ static void run_main_iter(
     // Check for new SLAM results and publish (rate-limited).
     auto pose = fast_lio.get_pose();
     if (!pose.empty() && (pose[0] != 0.0 || pose[1] != 0.0 || pose[2] != 0.0)) {
-        double ts = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
-        if (scan_publish_en && !g_lidar_topic.empty() && now - last_pc_publish >= pc_interval) {
-            // Sensor-frame cloud; register downstream via the odom pose.
-            // dense_publish_en false -> FAST-LIO's IESKF-downsampled scan.
-            auto cloud = dense_publish_en ? fast_lio.get_body_cloud() : fast_lio.get_body_cloud_down();
-            if (cloud && !cloud->empty()) {
-                publish_lidar(cloud, ts, g_sensor_frame_id);
+        auto odom = fast_lio.get_odometry();
+        double ts = odom.header.stamp.toSec();
+        if (ts <= 0.0) {
+            ts = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+        }
+        bool publish_lidar_en = scan_publish_en && !g_lidar_topic.empty();
+        bool publish_registered_en = registered_scan_publish_en && !g_registered_scan_topic.empty();
+        if ((publish_lidar_en || publish_registered_en) && now - last_pc_publish >= pc_interval) {
+            PointCloudXYZI::Ptr lidar_cloud;
+            PointCloudXYZI::Ptr registered_cloud;
+            if (publish_lidar_en) {
+                lidar_cloud = dense_publish_en ? fast_lio.get_body_cloud() : fast_lio.get_body_cloud_down();
+            }
+            if (publish_registered_en) {
+                registered_cloud = dense_publish_en ? fast_lio.get_world_cloud() : fast_lio.get_world_cloud_down();
+            }
+            if ((lidar_cloud && !lidar_cloud->empty()) || (registered_cloud && !registered_cloud->empty())) {
+                if (!g_odometry_topic.empty()) {
+                    publish_odometry(odom, ts);
+                    last_odom_publish = now;
+                }
+                publish_lidar(lidar_cloud, ts, g_sensor_frame_id);
+                publish_lidar(registered_cloud, ts, g_frame_id, g_registered_scan_topic);
             }
             last_pc_publish = now;
         }
 
         // Pose + covariance, rate-limited to odom_freq.
         if (!g_odometry_topic.empty() && now - last_odom_publish >= odom_interval) {
-            publish_odometry(fast_lio.get_odometry(), ts);
+            publish_odometry(odom, ts);
             last_odom_publish = now;
         }
     }
@@ -359,10 +377,11 @@ int main(int argc, char** argv) {
 
     // Required: LCM topics for output ports
     g_lidar_topic = mod.has("lidar") ? mod.topic("lidar") : "";
+    g_registered_scan_topic = mod.has("registered_scan") ? mod.topic("registered_scan") : "";
     g_odometry_topic = mod.has("odometry") ? mod.topic("odometry") : "";
 
-    if (g_lidar_topic.empty() && g_odometry_topic.empty()) {
-        fprintf(stderr, "Error: at least one of --lidar or --odometry is required\n");
+    if (g_lidar_topic.empty() && g_registered_scan_topic.empty() && g_odometry_topic.empty()) {
+        fprintf(stderr, "Error: at least one of --lidar, --registered_scan, or --odometry is required\n");
         return 1;
     }
 
@@ -402,9 +421,11 @@ int main(int argc, char** argv) {
     float pointcloud_freq = mod.arg_float("pointcloud_freq", 5.0f);
     float odom_freq = mod.arg_float("odom_freq", 50.0f);
 
-    // Cloud-publish behaviour: scan_publish_en gates the lidar output;
-    // dense_publish_en false voxel-downsamples the published cloud.
+    // Cloud-publish behaviour: scan_publish_en gates the legacy sensor/body-frame
+    // lidar output; registered_scan_publish_en gates the fixed-frame registered output.
+    // dense_publish_en false publishes FAST-LIO's IESKF-downsampled scan.
     bool scan_publish_en = mod.arg_bool("scan_publish_en", true);
+    bool registered_scan_publish_en = mod.arg_bool("registered_scan_publish_en", false);
     bool dense_publish_en = mod.arg_bool("dense_publish_en", true);
 
     // Verbose logging — propagates to the FAST-LIO C++ core via the
@@ -493,6 +514,7 @@ int main(int argc, char** argv) {
             pc_interval,
             odom_interval,
             scan_publish_en,
+            registered_scan_publish_en,
             dense_publish_en
         );
 

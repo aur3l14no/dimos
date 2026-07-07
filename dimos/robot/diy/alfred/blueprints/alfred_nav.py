@@ -55,6 +55,8 @@ alfred_nav = (
         FastLio2.blueprint(
             host_ip=os.getenv("LIDAR_HOST_IP", "192.168.1.5"),
             lidar_ip=os.getenv("LIDAR_IP", "192.168.1.189"),
+            scan_publish_en=False,
+            registered_scan_publish_en=True,
         ),
         create_cmu_nav(**nav_config),
         MovementManager.blueprint(),
@@ -69,8 +71,6 @@ alfred_nav = (
     )
     .remappings(
         [
-            # nav stack needs "registered_scan"
-            (FastLio2, "lidar", "registered_scan"),
             # SimplePlanner / FarPlanner owns way_point — disconnect MovementManager's
             (MovementManager, "way_point", "_mgr_way_point_unused"),
         ]

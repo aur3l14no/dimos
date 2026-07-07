@@ -28,7 +28,7 @@ mid360_fastlio = autoconnect(
 ).global_config(n_workers=2, robot_model="mid360_fastlio2")
 
 mid360_fastlio_voxels = autoconnect(
-    FastLio2.blueprint(),
+    FastLio2.blueprint(scan_publish_en=False, registered_scan_publish_en=True),
     VoxelGridMapper.blueprint(voxel_size=voxel_size, carve_columns=False),
     vis_module(
         "rerun",
@@ -38,6 +38,8 @@ mid360_fastlio_voxels = autoconnect(
             },
         },
     ),
+).remappings(
+    [(VoxelGridMapper, "lidar", "registered_scan")]
 ).global_config(n_workers=3, robot_model="mid360_fastlio2_voxels")
 
 mid360_fastlio_voxels_native = autoconnect(

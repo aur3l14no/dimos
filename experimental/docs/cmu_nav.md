@@ -3,7 +3,7 @@ title: "CMU Nav Stack"
 ---
 A modular navigation stack for autonomous robot navigation: terrain classification, obstacle avoidance, global path planning, local trajectory selection, and loop-closure-corrected mapping — composed as Blueprint modules.
 
-Good fit when you have a lidar-equipped robot and need end-to-end autonomy: feed it a registered point cloud and odometry, and it produces velocity commands. No ROS — modules communicate over DimOS streams (LCM/SHM).
+Good fit when you have a lidar-equipped robot and need end-to-end autonomy: feed it a fixed-frame registered point cloud and odometry, and it produces velocity commands. No ROS — modules communicate over DimOS streams (LCM/SHM).
 
 ```python session=cmu_nav
 from dimos.navigation.cmu_nav.main import create_cmu_nav
@@ -13,11 +13,11 @@ blueprint = create_cmu_nav()
 
 ## Streams
 
-The stack consumes (typically from a SLAM module like `FastLio2`):
+The stack consumes:
 
 | Stream | Type | Description |
 |--------|------|-------------|
-| `registered_scan` | `PointCloud2` | World-frame lidar scan |
+| `registered_scan` | `PointCloud2` | Fixed-frame registered lidar scan |
 | `odometry` | `Odometry` | SLAM odometry |
 
 It needs a goal source — `way_point` (`PointStamped`) drives the planners. A separate `MovementManager` module (`dimos/navigation/movement_manager/movement_manager.py`) is the usual goal source: it accepts `clicked_point` from a viewer/agent and produces `way_point`, plus it muxes `nav_cmd_vel` with `tele_cmd_vel` into the final `cmd_vel`.
@@ -179,7 +179,6 @@ If you have a Livox Mid-360 lidar and a module that consumes `cmd_vel: In[Twist]
 ```python skip
 from dimos.core.coordination.blueprints import autoconnect
 from dimos.hardware.sensors.lidar.fastlio2.module import FastLio2
-from dimos.msgs.geometry_msgs.Pose import Pose
 from dimos.navigation.movement_manager.movement_manager import MovementManager
 from dimos.navigation.cmu_nav.main import create_cmu_nav
 
@@ -190,7 +189,8 @@ my_robot_nav = (
         FastLio2.blueprint(
             host_ip="192.168.1.5",       # your machine's IP on the lidar network
             lidar_ip="192.168.1.155",
-            mount=Pose(z=0.5),           # sensor height above ground
+            scan_publish_en=False,
+            registered_scan_publish_en=True,
         ),
         create_cmu_nav(
             planner="simple",
@@ -199,10 +199,6 @@ my_robot_nav = (
         MovementManager.blueprint(),     # click→goal relay + teleop/nav velocity mux
         MyRobotControl.blueprint(),
     )
-    .remappings([
-        # FastLio2 publishes "lidar"; cmu_nav expects "registered_scan"
-        (FastLio2, "lidar", "registered_scan"),
-    ])
 )
 ```
 
@@ -234,8 +230,7 @@ class MyRobotControl(Module):
 
 ### Wiring notes
 
-- **Stream remap** — FastLio2 outputs `lidar`, cmu_nav expects `registered_scan`. `odometry` matches on both sides automatically.
-- **`mount` pose** — sensor position relative to the ground. `z` shifts the SLAM origin so ground sits at z=0, which TerrainAnalysis depends on.
+- **Registered scan stream** — CMU nav consumes fixed-frame scans from `registered_scan`. Set `registered_scan_publish_en=True` on FastLio2; if CMU nav is the only point-cloud consumer, also set `scan_publish_en=False` to avoid publishing the legacy body-frame `lidar` stream.
 - **`vehicle_height`** — tells TerrainAnalysis to ignore points above the robot (e.g. ceilings). Propagates to FarPlanner/SimplePlanner automatically.
 - **Differential drive** — for robots without strafe, set `path_follower={"vehicle_config": "standard"}`.
 
@@ -244,16 +239,21 @@ class MyRobotControl(Module):
 Add a Rerun bridge:
 
 ```python skip
-from dimos.navigation.cmu_nav.main import cmu_nav_rerun_config
+from dimos.navigation.cmu_nav.main import cmu_nav_rerun_config, create_cmu_nav
 from dimos.visualization.rerun.bridge import RerunBridgeModule
 
 my_robot_nav = autoconnect(
-    FastLio2.blueprint(...),
+    FastLio2.blueprint(
+        host_ip="192.168.1.5",
+        lidar_ip="192.168.1.155",
+        scan_publish_en=False,
+        registered_scan_publish_en=True,
+    ),
     create_cmu_nav(...),
     MovementManager.blueprint(),
     MyRobotControl.blueprint(),
     RerunBridgeModule.blueprint(**cmu_nav_rerun_config()),
-).remappings([(FastLio2, "lidar", "registered_scan")])
+)
 ```
 
 ### Teleop

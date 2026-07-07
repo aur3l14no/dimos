@@ -122,6 +122,8 @@ coordinator_flowbase_nav = (
         FastLio2.blueprint(
             host_ip=os.getenv("LIDAR_HOST_IP", "192.168.1.5"),
             lidar_ip=os.getenv("LIDAR_IP", "192.168.1.189"),
+            scan_publish_en=False,
+            registered_scan_publish_en=True,
         ),
         create_cmu_nav(
             planner="simple",
@@ -174,7 +176,6 @@ coordinator_flowbase_nav = (
     )
     .remappings(
         [
-            (FastLio2, "lidar", "registered_scan"),
             # SimplePlanner / FarPlanner owns way_point — disconnect MovementManager's
             # redundant pass-through copy (matches unitree-g1-nav-onboard).
             (MovementManager, "way_point", "_mgr_way_point_unused"),

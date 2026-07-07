@@ -13,9 +13,9 @@
       flake = false;
     };
     fast-lio = {
-      # get_body_cloud()/get_body_cloud_down() with the IMU<-lidar extrinsic
-      # applied (PR #1); retarget to jeff/feat/fastlio-body-cloud once merged.
-      url = "github:dimensionalOS/dimos-module-fastlio2?ref=ivan/fix/body-cloud-imu-extrinsic";
+      # get_world_cloud_down() plus body-cloud getters with the IMU<-lidar
+      # extrinsic applied; retarget once these DimOS-facing getters land upstream.
+      url = "github:aur3l14no/dimos-module-fastlio2?ref=feat/world-cloud-down";
       flake = false;
     };
     lcm-extended = {
