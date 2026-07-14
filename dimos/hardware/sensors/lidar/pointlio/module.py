@@ -90,8 +90,14 @@ class PointLioConfig(NativeModuleConfig):
     msr_freq: float = 50.0
     main_freq: float = 5000.0
 
+    # Output-rate ceilings. A genuine Point-LIO result is produced at most once
+    # per input frame, so odometry cannot exceed that result rate.
     pointcloud_freq: float = 10.0
     odom_freq: float = 30.0
+
+    # Publish behavior (passed to the binary as CLI args).
+    scan_publish_en: bool = True
+    deskewed_scan_publish_en: bool = False
 
     debug: bool = False
 
@@ -169,7 +175,15 @@ class PointLio(NativeModule, perception.Lidar, perception.Odometry):
     config: PointLioConfig
 
     lidar: Out[PointCloud2]
+    # filter_size_surf-downsampled endpoints registered at each point group's
+    # sensor time, then re-expressed in the final LiDAR frame. This is not a
+    # world-frame registered_scan.
+    deskewed_lidar: Out[PointCloud2]
     odometry: Out[Odometry]
+    # Exact companion pose for deskewed_lidar. Mapping consumers should use
+    # this pair instead of joining against independently rate-limited odometry.
+    # Twist/covariance retain core conventions without lever-arm correction.
+    lidar_odometry: Out[Odometry]
 
     @rpc
     def start(self) -> None:

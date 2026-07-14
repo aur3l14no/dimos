@@ -75,7 +75,10 @@
         fast-lio-patched = pkgs.applyPatches {
           name = "fast-lio-pointlio-patched";
           src = fast-lio;
-          patches = [ ./fastlio-resize-darwin.patch ];
+          patches = [
+            ./fastlio-resize-darwin.patch
+            ./pointlio-deskewed-output.patch
+          ];
         };
 
         pointlio_native = pkgs.stdenv.mkDerivation {
@@ -102,6 +105,13 @@
             "-DFASTLIO_DIR=${fast-lio-patched}"
             "-DLIVOX_COMMON_DIR=${livox-common}"
           ];
+
+          doCheck = true;
+          checkPhase = ''
+            runHook preCheck
+            ctest --output-on-failure
+            runHook postCheck
+          '';
         };
       in {
         packages = {
