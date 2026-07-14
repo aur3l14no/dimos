@@ -225,19 +225,25 @@ struct MapState {
     last_cloud_stamp: Option<f64>,
 }
 
+enum CloudEpoch {
+    Current,
+    New,
+}
+
 impl MapState {
     /// Accept a strictly newer cloud in the current frame. A changed frame or
     /// clear timestamp rewind starts a new map epoch; duplicate and slightly
     /// out-of-order clouds are dropped without disturbing the current map.
-    fn prepare_for_cloud(&mut self, frame_id: &str, stamp: f64) -> bool {
+    fn prepare_for_cloud(&mut self, frame_id: &str, stamp: f64) -> Option<CloudEpoch> {
         if frame_id.is_empty() {
             warn_throttled!(
                 Duration::from_secs(1),
                 "Odometry parent frame is empty; dropped a cloud.",
             );
-            return false;
+            return None;
         }
 
+        let mut epoch = CloudEpoch::Current;
         if self
             .frame_id
             .as_deref()
@@ -250,6 +256,7 @@ impl MapState {
                 "Odometry parent frame changed; starting a new voxel-map epoch.",
             );
             *self = Self::default();
+            epoch = CloudEpoch::New;
         } else if self
             .last_cloud_stamp
             .is_some_and(|last| last - stamp > POSE_MATCH_TOLERANCE_S)
@@ -261,6 +268,7 @@ impl MapState {
                 "Cloud timestamp rewound; starting a new voxel-map epoch.",
             );
             *self = Self::default();
+            epoch = CloudEpoch::New;
         } else if self.last_cloud_stamp.is_some_and(|last| stamp <= last) {
             warn_throttled!(
                 Duration::from_secs(1),
@@ -268,12 +276,12 @@ impl MapState {
                 new_stamp = stamp,
                 "Duplicate or out-of-order cloud timestamp; dropped a cloud.",
             );
-            return false;
+            return None;
         }
 
         self.frame_id = Some(frame_id.to_string());
         self.last_cloud_stamp = Some(stamp);
-        true
+        Some(epoch)
     }
 }
 
@@ -369,9 +377,12 @@ impl MapWorker {
         }
 
         let out_frame_id = pose.parent_frame.as_str();
-        if !state.prepare_for_cloud(out_frame_id, time_secs(&cloud.header.stamp)) {
-            return None;
-        }
+        let new_epoch = match state.prepare_for_cloud(out_frame_id, time_secs(&cloud.header.stamp))
+        {
+            Some(CloudEpoch::Current) => false,
+            Some(CloudEpoch::New) => true,
+            None => return None,
+        };
 
         // Transform sensor-frame points into the odometry parent frame.
         let rot = pose.rotation.to_rotation_matrix();
@@ -393,7 +404,7 @@ impl MapWorker {
         }
 
         state.frame_count += 1;
-        let local_due = emit_due(state.frame_count, self.config.emit_every);
+        let local_due = emit_due(state.frame_count, self.config.emit_every, new_epoch);
 
         let (bounds, cylinder) = if local_due {
             let margin = self.config.shadow_depth + voxel_size;
@@ -443,7 +454,7 @@ impl MapWorker {
         Some(EmissionPlan {
             bounds,
             local_bounds: cylinder,
-            global_due: emit_due(state.frame_count, self.config.global_emit_every),
+            global_due: emit_due(state.frame_count, self.config.global_emit_every, new_epoch),
             stamp: cloud.header.stamp,
             frame_id: out_frame_id.to_string(),
             live,
@@ -451,9 +462,10 @@ impl MapWorker {
     }
 }
 
-/// Whether the Nth-frame output fires this frame. Zero disables it.
-fn emit_due(frame_count: u32, every: u32) -> bool {
-    every != 0 && frame_count.is_multiple_of(every)
+/// Whether an enabled output fires on its interval or after a forced epoch reset.
+/// An interval of zero always disables the output.
+fn emit_due(frame_count: u32, every: u32, force: bool) -> bool {
+    every != 0 && (force || frame_count.is_multiple_of(every))
 }
 
 /// Odometry samples kept for cloud-stamp matching.
@@ -778,18 +790,27 @@ mod tests {
     #[test]
     fn map_epoch_rejects_small_reordering_and_resets_on_discontinuity() {
         let mut state = MapState::default();
-        assert!(state.prepare_for_cloud("odom", 10.0));
+        assert!(matches!(
+            state.prepare_for_cloud("odom", 10.0),
+            Some(CloudEpoch::Current)
+        ));
         state.map.voxels.insert((0, 0, 0), Voxel::with_health(1));
 
-        assert!(!state.prepare_for_cloud("odom", 10.0));
-        assert!(!state.prepare_for_cloud("odom", 9.95));
+        assert!(state.prepare_for_cloud("odom", 10.0).is_none());
+        assert!(state.prepare_for_cloud("odom", 9.95).is_none());
         assert_eq!(state.map.voxels.len(), 1);
 
-        assert!(state.prepare_for_cloud("odom", 9.0));
+        assert!(matches!(
+            state.prepare_for_cloud("odom", 9.0),
+            Some(CloudEpoch::New)
+        ));
         assert!(state.map.voxels.is_empty());
         state.map.voxels.insert((0, 0, 0), Voxel::with_health(1));
 
-        assert!(state.prepare_for_cloud("map", 9.01));
+        assert!(matches!(
+            state.prepare_for_cloud("map", 9.01),
+            Some(CloudEpoch::New)
+        ));
         assert!(state.map.voxels.is_empty());
         assert_eq!(state.frame_id.as_deref(), Some("map"));
     }
@@ -816,15 +837,17 @@ mod tests {
     }
 
     #[test]
-    fn emit_due_fires_every_nth_frame_and_zero_disables() {
-        assert!(emit_due(1, 1));
-        assert!(emit_due(2, 1));
-        assert!(!emit_due(1, 2));
-        assert!(emit_due(2, 2));
-        assert!(!emit_due(5, 3));
-        assert!(emit_due(6, 3));
+    fn emit_due_fires_on_interval_or_force_and_zero_disables() {
+        assert!(emit_due(1, 1, false));
+        assert!(emit_due(2, 1, false));
+        assert!(!emit_due(1, 2, false));
+        assert!(emit_due(2, 2, false));
+        assert!(!emit_due(5, 3, false));
+        assert!(emit_due(6, 3, false));
+        assert!(emit_due(1, 5, true));
         for n in 1..10 {
-            assert!(!emit_due(n, 0));
+            assert!(!emit_due(n, 0, false));
+            assert!(!emit_due(n, 0, true));
         }
     }
 
