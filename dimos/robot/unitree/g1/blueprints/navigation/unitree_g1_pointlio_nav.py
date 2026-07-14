@@ -14,6 +14,7 @@
 
 """Standalone G1 navigation with PointLIO, ray tracing, and A* replanning."""
 
+import os
 from typing import Any
 
 from dimos.core.coordination.blueprints import autoconnect
@@ -38,6 +39,7 @@ _OVERHEAD_SAFETY_MARGIN = 0.2
 _MAX_STEP_HEIGHT = 0.10
 _SAFE_RADIUS_MARGIN = 0.6
 _ROTATION_DIAMETER = 0.8
+_GROUND_Z = -G1.internal_odom_offsets["mid360_link"].position.z
 
 
 def _render_global_map(msg: PointCloud2) -> Any:
@@ -47,14 +49,14 @@ def _render_global_map(msg: PointCloud2) -> Any:
 def _render_costmap(msg: OccupancyGrid) -> Any:
     return msg.to_rerun(
         colormap="Accent",
-        z_offset=0.02,
+        z_offset=_GROUND_Z + 0.02,
         opacity=0.2,
         background="#484981",
     )
 
 
 def _render_path(msg: Path) -> Any:
-    return msg.to_rerun(z_offset=0.3)
+    return msg.to_rerun(z_offset=_GROUND_Z + 0.3)
 
 
 def _static_g1_body(rr: Any) -> list[Any]:
@@ -80,7 +82,7 @@ def _g1_pointlio_rerun_blueprint() -> Any:
             name="G1 PointLIO navigation",
             background=rrb.Background(kind="SolidColor", color=[0, 0, 0]),
             line_grid=rrb.LineGrid3D(
-                plane=rr.components.Plane3D.XY.with_distance(0.0),
+                plane=rr.components.Plane3D.XY.with_distance(_GROUND_Z),
             ),
         ),
         rrb.TimePanel(state="collapsed"),
@@ -114,6 +116,8 @@ unitree_g1_pointlio_nav = (
             pointcloud_freq=5.0,
             scan_publish_en=False,
             deskewed_scan_publish_en=True,
+            host_ip=os.getenv("LIDAR_HOST_IP", "192.168.123.164"),
+            lidar_ip=os.getenv("LIDAR_IP", "192.168.123.120"),
         ),
         RayTracingVoxelMap.blueprint(
             voxel_size=_VOXEL_SIZE,
