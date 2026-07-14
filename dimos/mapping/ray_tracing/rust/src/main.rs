@@ -13,19 +13,71 @@
 // limitations under the License.
 
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dimos_module::{error_throttled, run_with_transport, warn_throttled, Input, Module, Output};
 use dimos_voxel_ray_tracing::voxel_ray_tracer::{
-    batch_local_bounds, emit_points, update_map, Config, LocalBounds, VoxelMap,
+    batch_local_bounds, emit_points, update_map, Config, LocalBounds, VoxelKey, VoxelMap,
 };
 use lcm_msgs::geometry_msgs::{Point, Pose, PoseStamped, Quaternion};
 use lcm_msgs::nav_msgs::Odometry;
 use lcm_msgs::sensor_msgs::{PointCloud2, PointField};
 use lcm_msgs::std_msgs::{Header, Time};
 use nalgebra::{UnitQuaternion, Vector3};
+use tokio::sync::Notify;
+
+struct PoseSample {
+    stamp: f64,
+    pose: MatchedPose,
+}
+
+#[derive(Clone)]
+struct MatchedPose {
+    translation: Vector3<f32>,
+    rotation: UnitQuaternion<f32>,
+    parent_frame: String,
+    child_frame: String,
+}
+
+struct MapJob {
+    cloud: PointCloud2,
+    pose: MatchedPose,
+}
+
+/// A replaceable slot keeps only the newest value and wakes its single consumer.
+struct LatestSlot<T> {
+    pending: Mutex<Option<T>>,
+    wake: Notify,
+}
+
+impl<T> Default for LatestSlot<T> {
+    fn default() -> Self {
+        Self {
+            pending: Mutex::new(None),
+            wake: Notify::new(),
+        }
+    }
+}
+
+impl<T> LatestSlot<T> {
+    fn replace(&self, value: T) {
+        *self.pending.lock().expect("latest slot mutex") = Some(value);
+        self.wake.notify_one();
+    }
+
+    async fn next(&self) -> T {
+        loop {
+            self.wake.notified().await;
+            if let Some(value) = self.pending.lock().expect("latest slot mutex").take() {
+                return value;
+            }
+        }
+    }
+}
 
 #[derive(Module)]
+#[module(setup = spawn_worker, teardown = stop_worker)]
 struct RayTracingVoxelMap {
     #[input(decode = PointCloud2::decode, handler = on_lidar)]
     lidar: Input<PointCloud2>,
@@ -47,44 +99,261 @@ struct RayTracingVoxelMap {
     #[config]
     config: Config,
 
-    map: VoxelMap,
-    poses: VecDeque<(f64, Vector3<f32>, UnitQuaternion<f32>)>,
-    frame_count: u32,
-    batch_points: Vec<(f32, f32, f32)>,
-    batch_origins: Vec<(f32, f32, f32)>,
+    poses: VecDeque<PoseSample>,
+    // Latest cloud waiting for an exact pose or a later-pose watermark.
+    pending_cloud: Option<PointCloud2>,
+    latest_job: Arc<LatestSlot<MapJob>>,
+    worker: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RayTracingVoxelMap {
+    async fn spawn_worker(&mut self) {
+        let worker = MapWorker {
+            latest_job: Arc::clone(&self.latest_job),
+            config: self.config.clone(),
+            global_map: self.global_map.clone(),
+            local_map: self.local_map.clone(),
+            region_bounds: self.region_bounds.clone(),
+        };
+        self.worker = Some(tokio::spawn(worker.run()));
+    }
+
+    async fn stop_worker(&mut self) {
+        if let Some(handle) = self.worker.take() {
+            handle.abort();
+            handle_worker_exit(handle.await, true);
+        }
+    }
+
+    async fn ensure_worker_running(&mut self) {
+        // The derive runtime cannot select a module-owned task. Until it supports
+        // supervised tasks, continuous sensor input propagates a worker panic on
+        // the next message; teardown still aborts and joins the worker.
+        let Some(handle) = self.worker.as_ref() else {
+            panic!("map worker is not running");
+        };
+        if !handle.is_finished() {
+            return;
+        }
+        let handle = self.worker.take().expect("worker checked above");
+        handle_worker_exit(handle.await, false);
+    }
+
     async fn on_odometry(&mut self, msg: Odometry) {
+        self.ensure_worker_running().await;
         let p = &msg.pose.pose.position;
         let q = &msg.pose.pose.orientation;
-        push_pose(
+        let reset = push_pose(
             &mut self.poses,
-            (
-                time_secs(&msg.header.stamp),
-                Vector3::new(p.x as f32, p.y as f32, p.z as f32),
-                UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
-                    q.w as f32, q.x as f32, q.y as f32, q.z as f32,
-                )),
-            ),
+            PoseSample {
+                stamp: time_secs(&msg.header.stamp),
+                pose: MatchedPose {
+                    translation: Vector3::new(p.x as f32, p.y as f32, p.z as f32),
+                    rotation: UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+                        q.w as f32, q.x as f32, q.y as f32, q.z as f32,
+                    )),
+                    parent_frame: msg.header.frame_id.clone(),
+                    child_frame: msg.child_frame_id.clone(),
+                },
+            },
         );
+        if reset {
+            self.pending_cloud = None;
+            warn_throttled!(
+                Duration::from_secs(1),
+                "Odometry frame or timestamp epoch changed; cleared pending pose/cloud join state.",
+            );
+        }
+        self.try_hand_off_cloud();
     }
 
     async fn on_lidar(&mut self, msg: PointCloud2) {
-        // Register with the pose nearest the cloud stamp, never a stale one.
-        let Some((translation, rotation)) = nearest_pose(&self.poses, time_secs(&msg.header.stamp))
-        else {
-            warn_throttled!(
-                Duration::from_secs(1),
-                "No odometry within tolerance of the cloud stamp, dropped a cloud.",
-            );
+        self.ensure_worker_running().await;
+        self.pending_cloud = Some(msg);
+        self.try_hand_off_cloud();
+    }
+
+    fn try_hand_off_cloud(&mut self) {
+        let Some(cloud) = self.pending_cloud.as_ref() else {
             return;
         };
-        let origin = (translation.x, translation.y, translation.z);
+        let pose = match match_pose_for_cloud(&self.poses, time_secs(&cloud.header.stamp)) {
+            CloudPoseMatch::Pending => return,
+            CloudPoseMatch::Miss => {
+                warn_throttled!(
+                    Duration::from_secs(1),
+                    "No odometry within tolerance after crossing the cloud stamp; dropped a cloud.",
+                );
+                self.pending_cloud = None;
+                return;
+            }
+            CloudPoseMatch::Matched(pose) => pose,
+        };
 
+        if !cloud.header.frame_id.is_empty() && cloud.header.frame_id != pose.child_frame {
+            warn_throttled!(
+                Duration::from_secs(1),
+                cloud_frame = %cloud.header.frame_id,
+                odometry_child_frame = %pose.child_frame,
+                "Cloud frame does not match odometry child frame; dropped a cloud.",
+            );
+            self.pending_cloud = None;
+            return;
+        }
+
+        let cloud = self.pending_cloud.take().expect("cloud checked above");
+        self.latest_job.replace(MapJob { cloud, pose });
+    }
+}
+
+fn handle_worker_exit(result: Result<(), tokio::task::JoinError>, cancellation_expected: bool) {
+    match result {
+        Err(error) if cancellation_expected && error.is_cancelled() => {}
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => panic!("map worker stopped unexpectedly: {error}"),
+        Ok(()) => panic!("map worker exited unexpectedly"),
+    }
+}
+
+#[derive(Default)]
+struct MapState {
+    map: VoxelMap,
+    frame_count: u32,
+    batch_points: Vec<(f32, f32, f32)>,
+    batch_origins: Vec<(f32, f32, f32)>,
+    frame_id: Option<String>,
+    last_cloud_stamp: Option<f64>,
+}
+
+impl MapState {
+    /// Accept a strictly newer cloud in the current frame. A changed frame or
+    /// clear timestamp rewind starts a new map epoch; duplicate and slightly
+    /// out-of-order clouds are dropped without disturbing the current map.
+    fn prepare_for_cloud(&mut self, frame_id: &str, stamp: f64) -> bool {
+        if frame_id.is_empty() {
+            warn_throttled!(
+                Duration::from_secs(1),
+                "Odometry parent frame is empty; dropped a cloud.",
+            );
+            return false;
+        }
+
+        if self
+            .frame_id
+            .as_deref()
+            .is_some_and(|current| current != frame_id)
+        {
+            warn_throttled!(
+                Duration::from_secs(1),
+                previous_frame = ?self.frame_id,
+                new_frame = %frame_id,
+                "Odometry parent frame changed; starting a new voxel-map epoch.",
+            );
+            *self = Self::default();
+        } else if self
+            .last_cloud_stamp
+            .is_some_and(|last| last - stamp > POSE_MATCH_TOLERANCE_S)
+        {
+            warn_throttled!(
+                Duration::from_secs(1),
+                previous_stamp = ?self.last_cloud_stamp,
+                new_stamp = stamp,
+                "Cloud timestamp rewound; starting a new voxel-map epoch.",
+            );
+            *self = Self::default();
+        } else if self.last_cloud_stamp.is_some_and(|last| stamp <= last) {
+            warn_throttled!(
+                Duration::from_secs(1),
+                previous_stamp = ?self.last_cloud_stamp,
+                new_stamp = stamp,
+                "Duplicate or out-of-order cloud timestamp; dropped a cloud.",
+            );
+            return false;
+        }
+
+        self.frame_id = Some(frame_id.to_string());
+        self.last_cloud_stamp = Some(stamp);
+        true
+    }
+}
+
+struct EmissionPlan {
+    bounds: Option<PoseStamped>,
+    local_bounds: Option<LocalBounds>,
+    global_due: bool,
+    stamp: Time,
+    frame_id: String,
+    live: ahash::AHashSet<VoxelKey>,
+}
+
+struct MapWorker {
+    latest_job: Arc<LatestSlot<MapJob>>,
+    config: Config,
+    global_map: Output<PointCloud2>,
+    local_map: Output<PointCloud2>,
+    region_bounds: Output<PoseStamped>,
+}
+
+impl MapWorker {
+    async fn run(self) {
+        let mut state = MapState::default();
+        loop {
+            let job = self.latest_job.next().await;
+            self.process(&mut state, job).await;
+        }
+    }
+
+    async fn process(&self, state: &mut MapState, job: MapJob) {
+        let Some(plan) = tokio::task::block_in_place(|| self.update(state, job)) else {
+            return;
+        };
+        let EmissionPlan {
+            bounds,
+            local_bounds,
+            global_due,
+            stamp,
+            frame_id,
+            live,
+        } = plan;
+
+        if let Some(bounds) = bounds {
+            if let Err(error) = self.region_bounds.publish(&bounds).await {
+                error_throttled!(
+                    Duration::from_secs(1),
+                    error = %error,
+                    "Region bounds failed to publish",
+                );
+            }
+        }
+        if global_due {
+            let global = tokio::task::block_in_place(|| {
+                let points = emit_points(&state.map, self.config.voxel_size, None, 0, &live);
+                points_to_cloud(&points, &frame_id, stamp.clone())
+            });
+            publish_cloud(&self.global_map, &global).await;
+        }
+        if let Some(local_bounds) = local_bounds {
+            let local = tokio::task::block_in_place(|| {
+                let points = emit_points(
+                    &state.map,
+                    self.config.voxel_size,
+                    Some(&local_bounds),
+                    self.config.support_min,
+                    &live,
+                );
+                points_to_cloud(&points, &frame_id, stamp)
+            });
+            publish_cloud(&self.local_map, &local).await;
+        }
+    }
+
+    fn update(&self, state: &mut MapState, job: MapJob) -> Option<EmissionPlan> {
+        let MapJob { cloud, pose } = job;
+        let translation = pose.translation;
+        let origin = (translation.x, translation.y, translation.z);
         let voxel_size = self.config.voxel_size;
 
-        let points = match extract_xyz(&msg) {
+        let points = match extract_xyz(&cloud) {
             Ok(p) => p,
             Err(e) => {
                 warn_throttled!(
@@ -92,15 +361,20 @@ impl RayTracingVoxelMap {
                     error = %e,
                     "Failed to get lidar points, dropped a cloud.",
                 );
-                return;
+                return None;
             }
         };
         if points.is_empty() {
-            return;
+            return None;
         }
 
-        // Transform sensor-frame points into the world by the odom pose.
-        let rot = rotation.to_rotation_matrix();
+        let out_frame_id = pose.parent_frame.as_str();
+        if !state.prepare_for_cloud(out_frame_id, time_secs(&cloud.header.stamp)) {
+            return None;
+        }
+
+        // Transform sensor-frame points into the odometry parent frame.
+        let rot = pose.rotation.to_rotation_matrix();
         let points: Vec<(f32, f32, f32)> = points
             .iter()
             .map(|&(x, y, z)| {
@@ -109,35 +383,33 @@ impl RayTracingVoxelMap {
             })
             .collect();
 
-        let out_frame_id = "world";
-
-        let live = update_map(&mut self.map, origin, &points, &self.config);
+        let live = update_map(&mut state.map, origin, &points, &self.config);
 
         // The batch only feeds the local region bounds, so skip it when the local
         // map is disabled.
         if self.config.emit_every > 0 {
-            self.batch_points.extend_from_slice(&points);
-            self.batch_origins.push(origin);
+            state.batch_points.extend_from_slice(&points);
+            state.batch_origins.push(origin);
         }
 
-        self.frame_count += 1;
-        let local_due = emit_due(self.frame_count, self.config.emit_every);
+        state.frame_count += 1;
+        let local_due = emit_due(state.frame_count, self.config.emit_every);
 
-        let cylinder = if local_due {
+        let (bounds, cylinder) = if local_due {
             let margin = self.config.shadow_depth + voxel_size;
             let (cx, cy, radius, z_min, z_max) = batch_local_bounds(
-                &self.batch_points,
-                &self.batch_origins,
+                &state.batch_points,
+                &state.batch_origins,
                 self.config.region_percentile,
                 margin,
             );
-            self.batch_points.clear();
-            self.batch_origins.clear();
+            state.batch_points.clear();
+            state.batch_origins.clear();
 
             let bounds_msg = PoseStamped {
                 header: Header {
                     seq: 0,
-                    stamp: msg.header.stamp.clone(),
+                    stamp: cloud.header.stamp.clone(),
                     frame_id: out_frame_id.to_string(),
                 },
                 pose: Pose {
@@ -154,38 +426,28 @@ impl RayTracingVoxelMap {
                     },
                 },
             };
-            if let Err(e) = self.region_bounds.publish(&bounds_msg).await {
-                error_throttled!(
-                    Duration::from_secs(1),
-                    error = %e,
-                    "Region bounds failed to publish",
-                );
-            }
-            Some(LocalBounds {
-                origin_x: cx,
-                origin_y: cy,
-                r_xy_max_sq: radius * radius,
-                z_min,
-                z_max,
-            })
+            (
+                Some(bounds_msg),
+                Some(LocalBounds {
+                    origin_x: cx,
+                    origin_y: cy,
+                    r_xy_max_sq: radius * radius,
+                    z_min,
+                    z_max,
+                }),
+            )
         } else {
-            None
+            (None, None)
         };
 
-        let global_due = emit_due(self.frame_count, self.config.global_emit_every);
-
-        let stamp = msg.header.stamp;
-        let support_min = self.config.support_min;
-        if global_due {
-            let points = emit_points(&self.map, voxel_size, None, 0, &live);
-            let global = points_to_cloud(&points, out_frame_id, stamp.clone());
-            publish_cloud(&self.global_map, &global).await;
-        }
-        if let Some(cyl) = &cylinder {
-            let points = emit_points(&self.map, voxel_size, Some(cyl), support_min, &live);
-            let local = points_to_cloud(&points, out_frame_id, stamp);
-            publish_cloud(&self.local_map, &local).await;
-        }
+        Some(EmissionPlan {
+            bounds,
+            local_bounds: cylinder,
+            global_due: emit_due(state.frame_count, self.config.global_emit_every),
+            stamp: cloud.header.stamp,
+            frame_id: out_frame_id.to_string(),
+            live,
+        })
     }
 }
 
@@ -204,36 +466,61 @@ fn time_secs(t: &Time) -> f64 {
     t.sec as f64 + t.nsec as f64 * 1e-9
 }
 
-/// Append a pose sample, evicting the oldest to keep the buffer bounded.
-fn push_pose(
-    poses: &mut VecDeque<(f64, Vector3<f32>, UnitQuaternion<f32>)>,
-    sample: (f64, Vector3<f32>, UnitQuaternion<f32>),
-) {
+/// Append a pose sample, resetting on a changed frame or clear clock rewind and
+/// evicting the oldest sample to keep the buffer bounded. Returns whether the
+/// previous pose epoch was cleared.
+fn push_pose(poses: &mut VecDeque<PoseSample>, sample: PoseSample) -> bool {
+    let reset = poses.back().is_some_and(|last| {
+        last.pose.parent_frame != sample.pose.parent_frame
+            || last.pose.child_frame != sample.pose.child_frame
+            || last.stamp - sample.stamp > POSE_MATCH_TOLERANCE_S
+    });
+    if reset {
+        poses.clear();
+    }
     poses.push_back(sample);
     if poses.len() > POSE_BUFFER_LEN {
         poses.pop_front();
     }
+    reset
 }
 
 /// The buffered pose with the stamp nearest the cloud stamp, within tolerance.
-fn nearest_pose(
-    poses: &VecDeque<(f64, Vector3<f32>, UnitQuaternion<f32>)>,
-    stamp: f64,
-) -> Option<(Vector3<f32>, UnitQuaternion<f32>)> {
+fn nearest_pose(poses: &VecDeque<PoseSample>, stamp: f64) -> Option<MatchedPose> {
     let mut best_gap = f64::INFINITY;
     let mut best = None;
-    for &(t, v, q) in poses {
-        let gap = (t - stamp).abs();
+    for sample in poses {
+        let gap = (sample.stamp - stamp).abs();
         if gap < best_gap {
             best_gap = gap;
-            best = Some((v, q));
+            best = Some(sample);
         }
     }
     if best_gap <= POSE_MATCH_TOLERANCE_S {
-        best
+        best.map(|sample| sample.pose.clone())
     } else {
         None
     }
+}
+
+enum CloudPoseMatch {
+    /// No exact pose and no later-pose watermark yet, so keep the cloud pending.
+    Pending,
+    Matched(MatchedPose),
+    /// A later pose was observed, but no pose is within the fallback tolerance.
+    Miss,
+}
+
+/// Prefer an exact stamp. The bounded-nearest fallback is only final once a
+/// later pose proves the consumer has crossed the cloud timestamp.
+fn match_pose_for_cloud(poses: &VecDeque<PoseSample>, stamp: f64) -> CloudPoseMatch {
+    if let Some(sample) = poses.iter().find(|sample| sample.stamp == stamp) {
+        return CloudPoseMatch::Matched(sample.pose.clone());
+    }
+    if !poses.iter().any(|sample| sample.stamp > stamp) {
+        return CloudPoseMatch::Pending;
+    }
+    nearest_pose(poses, stamp).map_or(CloudPoseMatch::Miss, CloudPoseMatch::Matched)
 }
 
 struct ExtractError(&'static str);
@@ -369,16 +656,76 @@ async fn main() {
 mod tests {
     use super::*;
     use ahash::AHashSet;
-    use dimos_voxel_ray_tracing::voxel_ray_tracer::{Voxel, VoxelKey};
+    use dimos_voxel_ray_tracing::voxel_ray_tracer::Voxel;
+
+    fn pose_sample(stamp: f64, x: f32) -> PoseSample {
+        PoseSample {
+            stamp,
+            pose: MatchedPose {
+                translation: Vector3::new(x, 0.0, 0.0),
+                rotation: UnitQuaternion::identity(),
+                parent_frame: "odom".to_string(),
+                child_frame: "lidar".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_slot_handles_pre_notify_and_replaces_while_consumer_is_busy() {
+        let slot = Arc::new(LatestSlot::default());
+        slot.replace(1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), slot.next())
+                .await
+                .expect("pre-notified value should be ready"),
+            1
+        );
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let worker_slot = Arc::clone(&slot);
+        let worker = tokio::spawn(async move {
+            let first = worker_slot.next().await;
+            started_tx
+                .send(())
+                .expect("test receiver should remain open");
+            release_rx.await.expect("test sender should remain open");
+            (first, worker_slot.next().await)
+        });
+
+        slot.replace(2);
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("consumer should receive the first value")
+            .expect("consumer should signal that it is busy");
+        slot.replace(3);
+        slot.replace(4);
+        release_tx
+            .send(())
+            .expect("busy consumer should remain alive");
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), worker)
+                .await
+                .expect("consumer should finish")
+                .expect("consumer task should not panic"),
+            (2, 4)
+        );
+    }
 
     #[test]
     fn nearest_pose_picks_by_stamp_and_gates_on_tolerance() {
-        let mut poses: VecDeque<(f64, Vector3<f32>, UnitQuaternion<f32>)> = VecDeque::new();
-        for (t, x) in [(1.0, 1.0f32), (2.0, 2.0), (3.0, 3.0)] {
-            poses.push_back((t, Vector3::new(x, 0.0, 0.0), UnitQuaternion::identity()));
-        }
-        let (v, _) = nearest_pose(&poses, 2.04).expect("within tolerance");
-        assert_eq!(v.x, 2.0, "nearest stamp wins, not the latest");
+        let poses = VecDeque::from([
+            pose_sample(1.0, 1.0),
+            pose_sample(2.0, 2.0),
+            pose_sample(3.0, 3.0),
+        ]);
+        let pose = nearest_pose(&poses, 2.04).expect("within tolerance");
+        assert_eq!(
+            pose.translation.x, 2.0,
+            "nearest stamp wins, not the latest"
+        );
+        assert_eq!(pose.parent_frame, "odom");
         assert!(
             nearest_pose(&poses, 3.5).is_none(),
             "stale poses must not register a cloud"
@@ -387,21 +734,64 @@ mod tests {
     }
 
     #[test]
+    fn cloud_pose_match_waits_for_watermark_then_prefers_exact() {
+        let mut poses = VecDeque::from([pose_sample(1.96, 1.0)]);
+        assert!(matches!(
+            match_pose_for_cloud(&poses, 2.0),
+            CloudPoseMatch::Pending
+        ));
+
+        poses.push_back(pose_sample(2.08, 3.0));
+        let CloudPoseMatch::Matched(fallback) = match_pose_for_cloud(&poses, 2.0) else {
+            panic!("later pose should enable bounded-nearest fallback");
+        };
+        assert_eq!(fallback.translation.x, 1.0);
+
+        poses.push_back(pose_sample(2.0, 2.0));
+        let CloudPoseMatch::Matched(exact) = match_pose_for_cloud(&poses, 2.0) else {
+            panic!("exact pose should win even after the watermark");
+        };
+        assert_eq!(exact.translation.x, 2.0);
+
+        let miss = VecDeque::from([pose_sample(1.8, 1.0), pose_sample(2.2, 2.0)]);
+        assert!(matches!(
+            match_pose_for_cloud(&miss, 2.0),
+            CloudPoseMatch::Miss
+        ));
+    }
+
+    #[test]
     fn push_pose_evicts_oldest_beyond_capacity() {
-        let mut poses: VecDeque<(f64, Vector3<f32>, UnitQuaternion<f32>)> = VecDeque::new();
+        let mut poses = VecDeque::new();
         for i in 0..(POSE_BUFFER_LEN + 10) {
-            push_pose(
-                &mut poses,
-                (i as f64, Vector3::zeros(), UnitQuaternion::identity()),
-            );
+            assert!(!push_pose(&mut poses, pose_sample(i as f64, 0.0)));
         }
         assert_eq!(
             poses.len(),
             POSE_BUFFER_LEN,
             "buffer capped at POSE_BUFFER_LEN"
         );
-        assert_eq!(poses.front().unwrap().0, 10.0, "oldest 10 evicted");
-        assert_eq!(poses.back().unwrap().0, (POSE_BUFFER_LEN + 9) as f64);
+        assert_eq!(poses.front().unwrap().stamp, 10.0, "oldest 10 evicted");
+        assert_eq!(poses.back().unwrap().stamp, (POSE_BUFFER_LEN + 9) as f64);
+    }
+
+    #[test]
+    fn map_epoch_rejects_small_reordering_and_resets_on_discontinuity() {
+        let mut state = MapState::default();
+        assert!(state.prepare_for_cloud("odom", 10.0));
+        state.map.voxels.insert((0, 0, 0), Voxel::with_health(1));
+
+        assert!(!state.prepare_for_cloud("odom", 10.0));
+        assert!(!state.prepare_for_cloud("odom", 9.95));
+        assert_eq!(state.map.voxels.len(), 1);
+
+        assert!(state.prepare_for_cloud("odom", 9.0));
+        assert!(state.map.voxels.is_empty());
+        state.map.voxels.insert((0, 0, 0), Voxel::with_health(1));
+
+        assert!(state.prepare_for_cloud("map", 9.01));
+        assert!(state.map.voxels.is_empty());
+        assert_eq!(state.frame_id.as_deref(), Some("map"));
     }
 
     fn cloud_points(c: &PointCloud2) -> AHashSet<(u32, u32, u32)> {
