@@ -4,39 +4,80 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    # Relative git+file: will be deprecated (nix#12281) but there's no
-    # viable alternative for reaching local path deps outside the flake dir currently
-    # presumably an alternative will be added before this is removed.
-    dimos-repo = { url = "git+file:../../../..?ref=main"; flake = false; };
+    crane.url = "github:ipetkov/crane";
+    # Pure fallback for standalone `nix build path:.`; the runtime overrides
+    # this input with native/rust from the current checkout.
+    dimos-rust = {
+      url = "github:dimensionalOS/dimos?dir=native/rust";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, dimos-repo }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      crane,
+      dimos-rust,
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = import nixpkgs { inherit system; };
+        craneLib = crane.mkLib pkgs;
+        # File sets require a path, while non-flake inputs expose a string-like outPath.
+        dimosRustRoot = /. + builtins.unsafeDiscardStringContext dimos-rust.outPath;
 
-        src = pkgs.runCommand "voxel-ray-tracing-src" {} ''
+        crateSrc = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = craneLib.fileset.commonCargoSources ./.;
+        };
+
+        dimosRustSrc = pkgs.lib.fileset.toSource {
+          root = dimosRustRoot;
+          fileset = pkgs.lib.fileset.unions [
+            (craneLib.fileset.commonCargoSources (dimosRustRoot + "/dimos-module"))
+            (craneLib.fileset.commonCargoSources (dimosRustRoot + "/dimos-module-macros"))
+          ];
+        };
+
+        src = pkgs.runCommand "voxel-ray-tracing-src" { } ''
           mkdir -p $out/dimos/mapping/ray_tracing/rust
-          cp -r ${./src} $out/dimos/mapping/ray_tracing/rust/src
-          cp ${./Cargo.toml} $out/dimos/mapping/ray_tracing/rust/Cargo.toml
-          cp ${./Cargo.lock} $out/dimos/mapping/ray_tracing/rust/Cargo.lock
+          cp -r ${crateSrc}/src $out/dimos/mapping/ray_tracing/rust/src
+          cp ${crateSrc}/Cargo.toml $out/dimos/mapping/ray_tracing/rust/Cargo.toml
+          cp ${crateSrc}/Cargo.lock $out/dimos/mapping/ray_tracing/rust/Cargo.lock
 
           mkdir -p $out/native/rust
-          cp -r ${dimos-repo}/native/rust/dimos-module $out/native/rust/dimos-module
-          cp -r ${dimos-repo}/native/rust/dimos-module-macros $out/native/rust/dimos-module-macros
+          cp -r ${dimosRustSrc}/dimos-module $out/native/rust/dimos-module
+          cp -r ${dimosRustSrc}/dimos-module-macros $out/native/rust/dimos-module-macros
         '';
-      in {
-        packages.default = pkgs.rustPlatform.buildRustPackage {
+
+        commonArgs = {
           pname = "voxel-ray-tracing";
           version = "0.1.0";
 
           inherit src;
-          cargoRoot = "dimos/mapping/ray_tracing/rust";
-          buildAndTestSubdir = "dimos/mapping/ray_tracing/rust";
-
-          cargoHash = "sha256-0d0dlNDvDplA7oWTyUWOCOlS74Zie8uMQ+ps6lXntOI=";
-
-          meta.mainProgram = "voxel_ray_tracing";
+          cargoLock = ./Cargo.lock;
+          cargoToml = ./Cargo.toml;
+          postUnpack = ''
+            cd $sourceRoot/dimos/mapping/ray_tracing/rust
+            sourceRoot="."
+          '';
         };
-      });
+
+        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+      in
+      {
+        packages.cargoArtifacts = cargoArtifacts;
+        packages.default = craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
+
+            meta.mainProgram = "voxel_ray_tracing";
+          }
+        );
+      }
+    );
 }

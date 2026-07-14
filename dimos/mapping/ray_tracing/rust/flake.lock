@@ -1,20 +1,36 @@
 {
   "nodes": {
-    "dimos-repo": {
-      "flake": false,
+    "crane": {
       "locked": {
-        "lastModified": 1782159599,
-        "narHash": "sha256-U2FwqtFzYen8Or50oTYGrqSi8vRePlS3m581ti2T56Q=",
-        "ref": "main",
-        "rev": "0bfe9cbbc79c52afa1ccea783147438f89bd7cf2",
-        "revCount": 836,
-        "type": "git",
-        "url": "file:../../../.."
+        "lastModified": 1783203018,
+        "narHash": "sha256-G6R9IT/xwFuu+CYBWDUAok6AdC4ERC4ZfPPFtEpxnZE=",
+        "owner": "ipetkov",
+        "repo": "crane",
+        "rev": "80db5bdc391be8a1794f6d8a2d56e3a84ebcede2",
+        "type": "github"
       },
       "original": {
-        "ref": "main",
-        "type": "git",
-        "url": "file:../../../.."
+        "owner": "ipetkov",
+        "repo": "crane",
+        "type": "github"
+      }
+    },
+    "dimos-rust": {
+      "flake": false,
+      "locked": {
+        "dir": "native/rust",
+        "lastModified": 1783780679,
+        "narHash": "sha256-IwheZJlx1TieYV2stDwu3xsP91By/muM2Ta3nHEHqfM=",
+        "owner": "dimensionalOS",
+        "repo": "dimos",
+        "rev": "23cd255ad553729d6f826ac2a565c200861b82d5",
+        "type": "github"
+      },
+      "original": {
+        "dir": "native/rust",
+        "owner": "dimensionalOS",
+        "repo": "dimos",
+        "type": "github"
       }
     },
     "flake-utils": {
@@ -53,7 +69,8 @@
     },
     "root": {
       "inputs": {
-        "dimos-repo": "dimos-repo",
+        "crane": "crane",
+        "dimos-rust": "dimos-rust",
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs"
       }
