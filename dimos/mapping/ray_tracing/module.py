@@ -28,7 +28,10 @@ from dimos.spec import mapping
 class RayTracingVoxelMapConfig(NativeModuleConfig):
     cwd: str | None = "rust"
     executable: str = "result/bin/voxel_ray_tracing"
-    build_command: str | None = "nix build path:."
+    # Build against the current checkout; flake.lock remains the pure fallback.
+    build_command: str | None = (
+        "nix build path:. --override-input dimos-rust path:../../../../native/rust"
+    )
     stdin_config: bool = True
 
     voxel_size: float = 0.1
