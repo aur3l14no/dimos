@@ -1,0 +1,137 @@
+Point-LIO: expose a coherent point-time-deskewed lidar snapshot.
+
+The estimator already registers each filter_size_surf-downsampled point group
+with the state at that group's sensor time in feats_down_world. Preserve those
+endpoints, but express them in the lidar frame at the final processed group so
+the existing cloud-plus-odometry transport contract remains usable. This
+snapshot remains filter_size_surf-downsampled; it is not a world-frame
+registered_scan. Keep the existing body-cloud API unchanged, and surface
+whether a process call consumed a new scan; callers must not infer this from a
+retained last result.
+
+--- a/src/laserMapping.hpp
++++ b/src/laserMapping.hpp
+@@ -17,6 +17,11 @@ inline const bool time_list(PointType &x, PointType &y) {return (x.curvature <
+
+ using custom_messages::OdomMsgPtr;
+
++struct DeskewedLidarSnapshot {
++    PointCloudXYZI::Ptr cloud;
++    custom_messages::Odometry lidar_odometry;
++};
++
+ // Non-ROS Point-LIO front-end. Same public shape as the FAST-LIO2 module's
+ // LaserMapping so the LCM glue / PointLio wrapper is drop-in. Internals drive
+ // Point-LIO's IMU-as-output estimator. Method bodies are out-of-line below.
+@@ -33,9 +38,10 @@ public:
+     bool run_once(custom_messages::Odometry& odom_out);
+     void imu_cbk(const ImuConstPtr& msg_in);
+     void livox_pcl_cbk(const CstMsgConstPtr& msg);
+-    void run(OdomMsgPtr& msg_in);
++    bool run(OdomMsgPtr& msg_in);
+     PointCloudXYZI::Ptr get_world_cloud() const;
+     PointCloudXYZI::Ptr get_body_cloud() const;
++    DeskewedLidarSnapshot get_deskewed_lidar_snapshot() const;
+     std::vector<double> get_world_quat() const;
+     double get_world_vel_norm() const;
+     // FAST-LIO2-specific reactive guardrail hooks: no-ops here (Point-LIO
+@@ -164,6 +170,19 @@ void pointBodyLidarToIMU(PointType const *const pi, PointType *const po) {
+     po->intensity = pi->intensity;
+ }
+
++void get_world_lidar_pose(M3D &world_R_lidar, V3D &world_t_lidar) {
++    const M3D world_R_imu = use_imu_as_input ? kf_input.x_.rot : kf_output.x_.rot;
++    const V3D world_t_imu = use_imu_as_input ? kf_input.x_.pos : kf_output.x_.pos;
++    const M3D imu_R_lidar = extrinsic_est_en
++        ? (use_imu_as_input ? kf_input.x_.offset_R_L_I : kf_output.x_.offset_R_L_I)
++        : Lidar_R_wrt_IMU;
++    const V3D imu_t_lidar = extrinsic_est_en
++        ? (use_imu_as_input ? kf_input.x_.offset_T_L_I : kf_output.x_.offset_T_L_I)
++        : Lidar_T_wrt_IMU;
++    world_R_lidar = world_R_imu * imu_R_lidar;
++    world_t_lidar = world_R_imu * imu_t_lidar + world_t_imu;
++}
++
+ // iVox manages its own LRU/grid eviction; no ikd-Tree FOV box segmentation needed.
+
+
+@@ -1015,9 +1034,11 @@ LaserMapping::LaserMapping(const PointLioParams& params, double, double, double)
+ }
+ void LaserMapping::imu_cbk(const ImuConstPtr& msg_in) { ::imu_cbk(msg_in); }
+ void LaserMapping::livox_pcl_cbk(const CstMsgConstPtr& msg) { ::livox_pcl_cbk(msg); }
+-void LaserMapping::run(OdomMsgPtr& msg_in) {
++bool LaserMapping::run(OdomMsgPtr& msg_in) {
+     custom_messages::Odometry o;
+-    if (run_once(o)) { *msg_in = o; }
++    if (!run_once(o)) return false;
++    *msg_in = o;
++    return true;
+ }
+ PointCloudXYZI::Ptr LaserMapping::get_world_cloud() const {
+     if (!feats_undistort || feats_undistort->empty()) return nullptr;
+@@ -1044,6 +1065,44 @@ PointCloudXYZI::Ptr LaserMapping::get_body_cloud() const {
+     }
+     return cloud;
+ }
++DeskewedLidarSnapshot LaserMapping::get_deskewed_lidar_snapshot() const {
++    DeskewedLidarSnapshot snapshot;
++    if (!feats_down_world || feats_down_world->empty()) return snapshot;
++
++    M3D world_R_lidar;
++    V3D world_t_lidar;
++    get_world_lidar_pose(world_R_lidar, world_t_lidar);
++
++    snapshot.cloud.reset(new PointCloudXYZI(feats_down_world->size(), 1));
++    for (size_t i = 0; i < feats_down_world->size(); ++i) {
++        const PointType &point_world = feats_down_world->points[i];
++        const V3D world_point(point_world.x, point_world.y, point_world.z);
++        const V3D lidar_point = world_R_lidar.transpose() * (world_point - world_t_lidar);
++        PointType &point_lidar = snapshot.cloud->points[i];
++        point_lidar = point_world;
++        point_lidar.x = lidar_point.x();
++        point_lidar.y = lidar_point.y();
++        point_lidar.z = lidar_point.z();
++    }
++
++    custom_messages::Odometry &odometry = snapshot.lidar_odometry;
++    odometry = odomAftMapped;
++    odometry.header.stamp = get_ros_time(time_current);
++
++    const Eigen::Quaterniond world_q_lidar(world_R_lidar);
++
++    odometry.pose.pose.position.x = world_t_lidar.x();
++    odometry.pose.pose.position.y = world_t_lidar.y();
++    odometry.pose.pose.position.z = world_t_lidar.z();
++    odometry.pose.pose.orientation.x = world_q_lidar.x();
++    odometry.pose.pose.orientation.y = world_q_lidar.y();
++    odometry.pose.pose.orientation.z = world_q_lidar.z();
++    odometry.pose.pose.orientation.w = world_q_lidar.w();
++    // The new contract covers pose and stamp. Keep the estimator's existing
++    // twist convention; covariance is copied unchanged from odomAftMapped.
++    set_twist(odometry.twist.twist);
++    return snapshot;
++}
+ std::vector<double> LaserMapping::get_world_quat() const {
+     Eigen::Quaterniond q(kf_output.x_.rot);
+     return { q.coeffs()[0], q.coeffs()[1], q.coeffs()[2], q.coeffs()[3] };
+--- a/src/pointlio.hpp
++++ b/src/pointlio.hpp
+@@ -20,7 +20,7 @@ public:
+
+     void feed_imu(const ImuConstPtr &imu_data)   { laser_mapping->imu_cbk(imu_data); }
+     void feed_lidar(const CstMsgConstPtr &lidar) { laser_mapping->livox_pcl_cbk(lidar); }
+-    void process()                               { laser_mapping->run(odom_result); }
++    bool process()                               { return laser_mapping->run(odom_result); }
+
+     std::vector<double> get_pose() {
+         const auto &p = odom_result->pose.pose;
+@@ -30,6 +30,9 @@ public:
+     const custom_messages::Odometry& get_odometry() const { return *odom_result; }
+     PointCloudXYZI::Ptr get_world_cloud() const { return laser_mapping->get_world_cloud(); }
+     PointCloudXYZI::Ptr get_body_cloud() const { return laser_mapping->get_body_cloud(); }
++    DeskewedLidarSnapshot get_deskewed_lidar_snapshot() const {
++        return laser_mapping->get_deskewed_lidar_snapshot();
++    }
+
+     // Read-only state accessors (used by the LCM glue / ICP cross-check path).
+     std::vector<double> get_world_quat() const { return laser_mapping->get_world_quat(); }

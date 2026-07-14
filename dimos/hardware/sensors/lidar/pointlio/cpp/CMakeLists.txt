@@ -104,3 +104,9 @@ target_link_directories(pointlio_native PRIVATE
 )
 
 install(TARGETS pointlio_native DESTINATION bin)
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(pointlio_livox_time_test test_livox_time_mapper.cpp)
+  add_test(NAME pointlio_livox_time_test COMMAND pointlio_livox_time_test)
+endif()
