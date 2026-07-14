@@ -50,6 +50,8 @@ class Config(ModuleConfig):
     publish_loaded_map: bool = False
     fitness_threshold: float = 0.45
     use_carving: bool = True
+    live_frame: str = FRAME_WORLD
+    static_map_frame: str = FRAME_MAP
 
 
 class RelocalizationModule(Module):
@@ -74,7 +76,7 @@ class RelocalizationModule(Module):
 
         path = resolve_named_path(self.config.map_file, MAP_SUFFIX)
         self._premap = PointCloud2.lcm_decode(path.read_bytes())
-        self._premap.frame_id = FRAME_MAP
+        self._premap.frame_id = self.config.static_map_frame
 
         self.register_disposable(
             backpressure(
@@ -145,19 +147,20 @@ class RelocalizationModule(Module):
             return None
 
         # relocalize(scan, map) returns T such that scan_in_map_frame = T(scan_raw).
-        # We are publishing a TF for map_in_scan_frame, notice that the base frame is `world`
+        # We are publishing a TF for map_in_scan_frame, notice that the base frame is the
+        # configured live mapping frame.
         # so inverse the transform T here to get map_in_scan_frame
         T_inv = np.linalg.inv(T)
         new_tf = Transform(
             translation=Vector3(*T_inv[:3, 3]),
             rotation=Quaternion.from_rotation_matrix(T_inv[:3, :3]),
-            frame_id=FRAME_WORLD,
-            child_frame_id=FRAME_MAP,
+            frame_id=self.config.live_frame,
+            child_frame_id=self.config.static_map_frame,
         )
         logger.info(
             f"relocalize: fitness={fitness:.3f} time_cost={dt:.1f}s n_pts={n_pts} "
             f"reloc_t={T[:3, 3].round(3).tolist()} "
-            f"TF {FRAME_WORLD!r} -> {FRAME_MAP!r} "
+            f"TF {self.config.live_frame!r} -> {self.config.static_map_frame!r} "
             f"published_t={T_inv[:3, 3].round(3).tolist()} "
         )
         return new_tf
