@@ -22,6 +22,7 @@ use validator::ValidationError;
 pub type VoxelKey = (i32, i32, i32);
 pub type VoxelHealth = i32;
 
+#[derive(Clone)]
 #[native_config]
 #[validate(schema(function = "validate_health_range"))]
 pub struct Config {
