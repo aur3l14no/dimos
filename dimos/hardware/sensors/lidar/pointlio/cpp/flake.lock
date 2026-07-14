@@ -39,16 +39,16 @@
       "locked": {
         "lastModified": 1783023293,
         "narHash": "sha256-isV6Jn3ACmpRFzUvm65cknT4B8bvswox93BBzEUHgUw=",
-        "ref": "main",
+        "owner": "dimensionalOS",
+        "repo": "dimos-module-pointlio",
         "rev": "82ef3a327347e2866e981bd95c8bece8b72903cf",
-        "revCount": 76,
-        "type": "git",
-        "url": "ssh://git@github.com/dimensionalOS/dimos-module-pointlio"
+        "type": "github"
       },
       "original": {
+        "owner": "dimensionalOS",
         "ref": "main",
-        "type": "git",
-        "url": "ssh://git@github.com/dimensionalOS/dimos-module-pointlio"
+        "repo": "dimos-module-pointlio",
+        "type": "github"
       }
     },
     "flake-utils": {
@@ -106,14 +106,21 @@
         ]
       },
       "locked": {
-        "path": "../../livox/cpp",
-        "type": "path"
+        "dir": "dimos/hardware/sensors/lidar/livox/cpp",
+        "lastModified": 1783780679,
+        "narHash": "sha256-IwheZJlx1TieYV2stDwu3xsP91By/muM2Ta3nHEHqfM=",
+        "owner": "dimensionalOS",
+        "repo": "dimos",
+        "rev": "23cd255ad553729d6f826ac2a565c200861b82d5",
+        "type": "github"
       },
       "original": {
-        "path": "../../livox/cpp",
-        "type": "path"
-      },
-      "parent": []
+        "dir": "dimos/hardware/sensors/lidar/livox/cpp",
+        "owner": "dimensionalOS",
+        "ref": "main",
+        "repo": "dimos",
+        "type": "github"
+      }
     },
     "nixpkgs": {
       "locked": {

@@ -4,7 +4,9 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    livox-sdk.url = "path:../../livox/cpp";
+    # Keep the native-module flake standalone for pure and remote evaluation.
+    # The sibling path is outside this flake's copied source tree.
+    livox-sdk.url = "github:dimensionalOS/dimos/main?dir=dimos/hardware/sensors/lidar/livox/cpp";
     livox-sdk.inputs.nixpkgs.follows = "nixpkgs";
     livox-sdk.inputs.flake-utils.follows = "flake-utils";
     livox-sdk.inputs.lcm-extended.follows = "lcm-extended";
@@ -13,9 +15,7 @@
       flake = false;
     };
     fast-lio = {
-      # Point-LIO fork (split out of dimos-module-fastlio2's pointlio branch).
-      # Repo is org-internal for now, hence git+ssh instead of github:.
-      url = "git+ssh://git@github.com/dimensionalOS/dimos-module-pointlio?ref=main";
+      url = "github:dimensionalOS/dimos-module-pointlio?ref=main";
       flake = false;
     };
     lcm-extended = {
@@ -66,7 +66,7 @@
         livox-sdk2 = livox-sdk.packages.${system}.livox-sdk2;
         lcm = lcm-extended.packages.${system}.lcm;
 
-        livox-common = ../../common;
+        livox-common = livox-sdk.outPath + "/../../common";
 
         # Patch the Point-LIO fork in place: resize (not reserve) the per-point
         # vectors in run_once, whose reserve+operator[] is out-of-bounds UB that
