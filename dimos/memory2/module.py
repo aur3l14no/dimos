@@ -272,6 +272,9 @@ class RecorderConfig(MemoryModuleConfig):
     # read the active remappings from inside the module (AFAIK), so this config
     # arg does the per-stream rename directly.
     stream_remapping: dict[str, str] = Field(default_factory=dict)
+    # Skip observations whose pose cannot be resolved. Most recorders preserve
+    # them for later repair; mapping recorders can opt into fail-closed input.
+    drop_unposed: bool = False
 
 
 PoseSetter = Callable[[Any], "Awaitable[Pose | None]"]
@@ -383,6 +386,14 @@ class Recorder(MemoryModule):
             ts = self._resolve_ts(name, msg)
             pose = await self._resolve_pose(name, msg, ts)
             if not pose:
+                if self.config.drop_unposed:
+                    logger.warning(
+                        "[%s] No pose for time %s (msg ts: %s), dropping observation",
+                        name,
+                        ts,
+                        getattr(msg, "ts", None),
+                    )
+                    return
                 logger.warning(
                     "[%s] No pose for time %s (msg ts: %s), storing without pose",
                     name,

@@ -96,6 +96,9 @@ htmlcov/
 # Memory2 autorecord
 recording*.db
 
+# Built map
+*.pc2.lcm
+
 # Rerun recordings
 *.rrd
 
