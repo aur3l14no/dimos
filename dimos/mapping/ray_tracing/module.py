@@ -33,6 +33,9 @@ class RayTracingVoxelMapConfig(NativeModuleConfig):
     )
     stdin_config: bool = True
 
+    # Require odometry stamped exactly like each cloud. By default, wait for
+    # the odometry watermark and then use the nearest pose within 100 ms.
+    require_exact_pose_match: bool = False
     voxel_size: float = 0.1
     # Maximum range for ray tracing
     max_range: float = 30.0

@@ -26,6 +26,9 @@ pub type VoxelHealth = i32;
 #[derive(Clone)]
 #[validate(schema(function = "validate_health_range"))]
 pub struct Config {
+    /// Require a pose with exactly the cloud stamp instead of falling back to
+    /// the nearest pose after the odometry watermark passes it.
+    pub require_exact_pose_match: bool,
     #[validate(range(exclusive_min = 0.0))]
     pub voxel_size: f32,
     #[validate(range(min = 0.0))]
@@ -721,6 +724,7 @@ mod tests {
 
     fn basic_config() -> Config {
         Config {
+            require_exact_pose_match: false,
             voxel_size: 1.0,
             max_range: 100.0,
             ray_subsample: 1,
@@ -928,6 +932,7 @@ mod tests {
         let voxel_size = 0.1_f32;
         let lidar_height = 1.0_f32;
         let cfg = Config {
+            require_exact_pose_match: false,
             voxel_size,
             max_range: 50.0,
             ray_subsample: 1,
@@ -1083,6 +1088,7 @@ mod tests {
         let voxel_size = 0.1_f32;
         let half = voxel_size * 0.5;
         let cfg = Config {
+            require_exact_pose_match: false,
             voxel_size,
             max_range: 50.0,
             ray_subsample: 1,
@@ -1157,6 +1163,7 @@ mod tests {
         let voxel_size = 0.1_f32;
         let half = voxel_size * 0.5;
         let cfg = Config {
+            require_exact_pose_match: false,
             voxel_size,
             max_range: 50.0,
             ray_subsample: 1,
@@ -1219,6 +1226,7 @@ mod tests {
         let voxel_size = 0.1_f32;
         let half = voxel_size * 0.5;
         let cfg = |graze_cos| Config {
+            require_exact_pose_match: false,
             voxel_size,
             max_range: 50.0,
             ray_subsample: 1,
@@ -1350,6 +1358,7 @@ mod tests {
         let ray = vec![(8.0_f32, 0.0, 0.0)];
 
         let cfg = Config {
+            require_exact_pose_match: false,
             voxel_size,
             max_range: 50.0,
             ray_subsample: 1,

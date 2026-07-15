@@ -36,7 +36,7 @@ struct MapJob {
 
 #[derive(Clone)]
 struct PoseSample {
-    stamp: f64,
+    stamp: Time,
     translation: Vector3<f32>,
     rotation: UnitQuaternion<f32>,
     parent_frame: String,
@@ -47,6 +47,19 @@ struct PoseSample {
 enum FrameContractError {
     EmptyParentFrame,
     CloudFrameMismatch,
+}
+
+#[derive(Debug, PartialEq)]
+enum PoseDropReason {
+    MissingExactPose,
+    OutsideTolerance,
+    Frame(FrameContractError),
+}
+
+enum PoseMatch {
+    Pending,
+    Drop(PoseDropReason),
+    Matched(PoseSample),
 }
 
 struct LatestState<T> {
@@ -138,6 +151,7 @@ struct RayTracingVoxelMap {
     config: Config,
 
     poses: VecDeque<PoseSample>,
+    pending_cloud: Option<PointCloud2>,
     latest_job: Arc<LatestSlot<MapJob>>,
     worker: Option<tokio::task::JoinHandle<()>>,
 }
@@ -178,7 +192,7 @@ impl RayTracingVoxelMap {
         let p = &msg.pose.pose.position;
         let q = &msg.pose.pose.orientation;
         let sample = PoseSample {
-            stamp: time_secs(&msg.header.stamp),
+            stamp: msg.header.stamp,
             translation: Vector3::new(p.x as f32, p.y as f32, p.z as f32),
             rotation: UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
                 q.w as f32, q.x as f32, q.y as f32, q.z as f32,
@@ -186,28 +200,47 @@ impl RayTracingVoxelMap {
             parent_frame: msg.header.frame_id,
             child_frame: msg.child_frame_id,
         };
-        push_pose(&mut self.poses, sample);
+        if push_pose(&mut self.poses, sample) {
+            self.pending_cloud = None;
+        }
+        self.try_handoff_pending();
     }
 
     async fn on_lidar(&mut self, msg: PointCloud2) {
         self.ensure_worker_running().await;
-        let Some(pose) = nearest_pose(&self.poses, time_secs(&msg.header.stamp)) else {
+        if self.pending_cloud.replace(msg).is_some() {
             warn_throttled!(
                 Duration::from_secs(1),
-                "No odometry within tolerance of the cloud stamp, dropped a cloud.",
+                "Replaced a cloud that was waiting for its odometry watermark.",
             );
+        }
+        self.try_handoff_pending();
+    }
+
+    fn try_handoff_pending(&mut self) {
+        let Some(cloud) = self.pending_cloud.as_ref() else {
             return;
         };
-        if let Err(error) = validate_frames(&pose, &msg) {
-            warn_throttled!(
-                Duration::from_secs(1),
-                error = ?error,
-                "Cloud and odometry frames are incompatible; dropped a cloud.",
-            );
-            return;
-        }
+        let matched = match_pose(&self.poses, cloud, self.config.require_exact_pose_match);
+        let pose = match matched {
+            PoseMatch::Pending => return,
+            PoseMatch::Drop(reason) => {
+                self.pending_cloud = None;
+                warn_throttled!(
+                    Duration::from_secs(1),
+                    reason = ?reason,
+                    "No valid odometry match for the cloud; dropped it.",
+                );
+                return;
+            }
+            PoseMatch::Matched(pose) => pose,
+        };
+        let cloud = self
+            .pending_cloud
+            .take()
+            .expect("pending cloud was matched above");
         if let Some(replaced_total) = self.latest_job.replace(MapJob {
-            cloud: msg,
+            cloud,
             translation: pose.translation,
             rotation: pose.rotation,
             parent_frame: pose.parent_frame,
@@ -443,11 +476,11 @@ fn emit_due_or_frame_change(frame_count: u32, every: u32, frame_changed: bool) -
 /// Odometry samples kept for cloud-stamp matching.
 const POSE_BUFFER_LEN: usize = 256;
 
-/// Max stamp gap between a cloud and the pose used to register it (s).
-const POSE_MATCH_TOLERANCE_S: f64 = 0.1;
+/// Max stamp gap between a cloud and the pose used to register it.
+const POSE_MATCH_TOLERANCE_NS: i64 = 100_000_000;
 
-fn time_secs(t: &Time) -> f64 {
-    t.sec as f64 + t.nsec as f64 * 1e-9
+fn time_nanos(t: &Time) -> i64 {
+    i64::from(t.sec) * 1_000_000_000 + i64::from(t.nsec)
 }
 
 /// Append a pose sample, resetting on a frame epoch change.
@@ -467,21 +500,45 @@ fn push_pose(poses: &mut VecDeque<PoseSample>, sample: PoseSample) -> bool {
     frames_changed
 }
 
-/// The buffered pose with the stamp nearest the cloud stamp, within tolerance.
-fn nearest_pose(poses: &VecDeque<PoseSample>, stamp: f64) -> Option<PoseSample> {
-    let mut best_gap = f64::INFINITY;
+/// Match only after an exact sample arrives or a newer pose establishes a
+/// watermark. This keeps a cloud pending while an exact sample may still arrive.
+fn match_pose(
+    poses: &VecDeque<PoseSample>,
+    cloud: &PointCloud2,
+    require_exact_pose_match: bool,
+) -> PoseMatch {
+    if let Some(pose) = poses
+        .iter()
+        .rev()
+        .find(|pose| pose.stamp == cloud.header.stamp)
+    {
+        return validate_matched_pose(pose, cloud);
+    }
+
+    let cloud_stamp_ns = time_nanos(&cloud.header.stamp);
+    if !poses
+        .iter()
+        .any(|pose| time_nanos(&pose.stamp) > cloud_stamp_ns)
+    {
+        return PoseMatch::Pending;
+    }
+    if require_exact_pose_match {
+        return PoseMatch::Drop(PoseDropReason::MissingExactPose);
+    }
+
+    let mut best_gap = u64::MAX;
     let mut best = None;
     for pose in poses {
-        let gap = (pose.stamp - stamp).abs();
+        let gap = (time_nanos(&pose.stamp) - cloud_stamp_ns).unsigned_abs();
         if gap < best_gap {
             best_gap = gap;
-            best = Some(pose.clone());
+            best = Some(pose);
         }
     }
-    if best_gap <= POSE_MATCH_TOLERANCE_S {
-        best
+    if best_gap <= POSE_MATCH_TOLERANCE_NS as u64 {
+        validate_matched_pose(best.expect("a newer pose established the watermark"), cloud)
     } else {
-        None
+        PoseMatch::Drop(PoseDropReason::OutsideTolerance)
     }
 }
 
@@ -493,6 +550,13 @@ fn validate_frames(pose: &PoseSample, cloud: &PointCloud2) -> Result<(), FrameCo
         return Err(FrameContractError::CloudFrameMismatch);
     }
     Ok(())
+}
+
+fn validate_matched_pose(pose: &PoseSample, cloud: &PointCloud2) -> PoseMatch {
+    match validate_frames(pose, cloud) {
+        Ok(()) => PoseMatch::Matched(pose.clone()),
+        Err(error) => PoseMatch::Drop(PoseDropReason::Frame(error)),
+    }
 }
 
 struct ExtractError(&'static str);
@@ -654,7 +718,7 @@ mod tests {
 
     fn pose(milliseconds: i32, x: f32, parent_frame: &str, child_frame: &str) -> PoseSample {
         PoseSample {
-            stamp: milliseconds as f64 / 1_000.0,
+            stamp: stamp(milliseconds),
             translation: Vector3::new(x, 0.0, 0.0),
             rotation: UnitQuaternion::identity(),
             parent_frame: parent_frame.to_string(),
@@ -674,18 +738,63 @@ mod tests {
     }
 
     #[test]
-    fn nearest_pose_picks_by_stamp_and_gates_on_tolerance() {
+    fn pose_match_waits_for_watermark_and_prefers_exact_stamp() {
         let mut poses = VecDeque::new();
         push_pose(&mut poses, pose(1_950, 1.0, "odom", "lidar"));
+        let pointcloud = cloud(2_000, "lidar");
+
+        assert!(matches!(
+            match_pose(&poses, &pointcloud, false),
+            PoseMatch::Pending
+        ));
+
         push_pose(&mut poses, pose(2_000, 2.0, "odom", "lidar"));
         push_pose(&mut poses, pose(2_080, 3.0, "odom", "lidar"));
-
-        let exact = nearest_pose(&poses, 2.0).expect("exact pose should match");
+        let PoseMatch::Matched(exact) = match_pose(&poses, &pointcloud, false) else {
+            panic!("exact pose should match")
+        };
         assert_eq!(exact.translation.x, 2.0);
-        let nearest = nearest_pose(&poses, 2.05).expect("nearest pose should match");
+
+        let later_cloud = cloud(2_050, "lidar");
+        let PoseMatch::Matched(nearest) = match_pose(&poses, &later_cloud, false) else {
+            panic!("watermark should allow a nearest-pose match")
+        };
         assert_eq!(nearest.translation.x, 3.0);
-        assert!(nearest_pose(&poses, 3.0).is_none());
-        assert!(nearest_pose(&VecDeque::new(), 1.0).is_none());
+
+        let far_cloud = cloud(3_000, "lidar");
+        assert!(matches!(
+            match_pose(&poses, &far_cloud, false),
+            PoseMatch::Pending
+        ));
+        push_pose(&mut poses, pose(3_200, 4.0, "odom", "lidar"));
+        assert!(matches!(
+            match_pose(&poses, &far_cloud, false),
+            PoseMatch::Drop(PoseDropReason::OutsideTolerance)
+        ));
+    }
+
+    #[test]
+    fn exact_only_pose_match_drops_after_watermark() {
+        let exact_cloud = cloud(1_000, "lidar");
+        let exact_poses = VecDeque::from([pose(1_000, 0.0, "odom", "lidar")]);
+        assert!(matches!(
+            match_pose(&exact_poses, &exact_cloud, true),
+            PoseMatch::Matched(_)
+        ));
+
+        let mut poses = VecDeque::new();
+        let pointcloud = cloud(2_000, "lidar");
+        push_pose(&mut poses, pose(1_950, 1.0, "odom", "lidar"));
+        assert!(matches!(
+            match_pose(&poses, &pointcloud, true),
+            PoseMatch::Pending
+        ));
+
+        push_pose(&mut poses, pose(2_080, 2.0, "odom", "lidar"));
+        assert!(matches!(
+            match_pose(&poses, &pointcloud, true),
+            PoseMatch::Drop(PoseDropReason::MissingExactPose)
+        ));
     }
 
     #[test]
@@ -716,10 +825,10 @@ mod tests {
             POSE_BUFFER_LEN,
             "buffer capped at POSE_BUFFER_LEN"
         );
-        assert_eq!(poses.front().unwrap().stamp, 0.01, "oldest 10 evicted");
+        assert_eq!(poses.front().unwrap().stamp, stamp(10), "oldest 10 evicted");
         assert_eq!(
             poses.back().unwrap().stamp,
-            (POSE_BUFFER_LEN + 9) as f64 / 1_000.0
+            stamp((POSE_BUFFER_LEN + 9) as i32)
         );
     }
 
