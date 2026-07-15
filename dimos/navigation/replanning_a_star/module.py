@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from threading import RLock
 from typing import Any
 
 from dimos_lcm.std_msgs import Bool, String
@@ -37,6 +38,7 @@ logger = setup_logger()
 class ReplanningAStarPlannerConfig(ModuleConfig):
     robot_width: float | None = None
     robot_rotation_diameter: float | None = None
+    require_navigation_enabled: bool = False
 
 
 class ReplanningAStarPlanner(Module, NavigationInterface):
@@ -49,6 +51,7 @@ class ReplanningAStarPlanner(Module, NavigationInterface):
     clicked_point: In[PointStamped]
     target: In[PoseStamped]
     stop_movement: In[Bool]
+    navigation_enabled: In[Bool]
 
     goal_reached: Out[Bool]
     navigation_state: Out[String]  # TODO: set it
@@ -57,6 +60,10 @@ class ReplanningAStarPlanner(Module, NavigationInterface):
     navigation_costmap: Out[OccupancyGrid]
 
     _planner: GlobalPlanner
+    _navigation_enabled: bool
+    _navigation_enable_pending: bool
+    _navigation_gate_lock: RLock
+    _active_goal_requests: int
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -72,9 +79,18 @@ class ReplanningAStarPlanner(Module, NavigationInterface):
             self.config.g.model_copy(update=overrides) if overrides else self.config.g
         )
         self._planner = GlobalPlanner(effective_global_config)
+        self._navigation_enabled = not self.config.require_navigation_enabled
+        self._navigation_enable_pending = False
+        self._navigation_gate_lock = RLock()
+        self._active_goal_requests = 0
 
     @rpc
     def start(self) -> None:
+        if self.config.require_navigation_enabled:
+            with self._navigation_gate_lock:
+                self._navigation_enabled = False
+                self._navigation_enable_pending = False
+
         super().start()
 
         self.register_disposable(Disposable(self.odom.subscribe(self._planner.handle_odom)))
@@ -88,20 +104,21 @@ class ReplanningAStarPlanner(Module, NavigationInterface):
         self.register_disposable(
             Disposable(self.global_costmap.subscribe(self._planner.handle_global_costmap))
         )
-        self.register_disposable(
-            Disposable(self.goal_request.subscribe(self._planner.handle_goal_request))
-        )
-        self.register_disposable(
-            Disposable(self.target.subscribe(self._planner.handle_goal_request))
-        )
+        self.register_disposable(Disposable(self.goal_request.subscribe(self._handle_goal_request)))
+        self.register_disposable(Disposable(self.target.subscribe(self._handle_goal_request)))
 
         self.register_disposable(
             Disposable(
                 self.clicked_point.subscribe(
-                    lambda pt: self._planner.handle_goal_request(pt.to_pose_stamped())
+                    lambda pt: self._handle_goal_request(pt.to_pose_stamped())
                 )
             )
         )
+
+        if self.config.require_navigation_enabled:
+            self.register_disposable(
+                Disposable(self.navigation_enabled.subscribe(self._on_navigation_enabled))
+            )
 
         if self.stop_movement.transport is not None:
             self.register_disposable(
@@ -132,10 +149,66 @@ class ReplanningAStarPlanner(Module, NavigationInterface):
         if msg.data:
             self.cancel_goal()
 
+    def _on_navigation_enabled(self, msg: Bool) -> None:
+        if not self.config.require_navigation_enabled:
+            return
+
+        enabled = bool(msg.data)
+        with self._navigation_gate_lock:
+            if enabled:
+                if self._active_goal_requests == 0:
+                    self._navigation_enabled = True
+                else:
+                    self._navigation_enable_pending = True
+                return
+
+            was_enabled = self._navigation_enabled
+            self._navigation_enabled = False
+            self._navigation_enable_pending = False
+            if was_enabled:
+                # GlobalPlanner cancellation is not goal-scoped. Keep the gate
+                # locked so a concurrent enable cannot admit a new goal before
+                # this cancellation has finished.
+                self.cancel_goal()
+
+    def _handle_goal_request(self, goal: PoseStamped) -> bool:
+        if not self.config.require_navigation_enabled:
+            self._planner.handle_goal_request(goal)
+            return True
+
+        with self._navigation_gate_lock:
+            if not self._navigation_enabled:
+                logger.warning("Navigation goal rejected", reason="localization_not_ready")
+                return False
+            self._active_goal_requests += 1
+
+        try:
+            self._planner.handle_goal_request(goal)
+        finally:
+            navigation_enabled = self._finish_goal_request()
+        return navigation_enabled
+
+    def _finish_goal_request(self) -> bool:
+        with self._navigation_gate_lock:
+            navigation_enabled = self._navigation_enabled
+
+        try:
+            if not navigation_enabled:
+                self.cancel_goal()
+        finally:
+            with self._navigation_gate_lock:
+                self._active_goal_requests -= 1
+                # An enable received while an old goal handler was still active
+                # is deferred until its compensating global cancel is complete.
+                if self._active_goal_requests == 0 and self._navigation_enable_pending:
+                    self._navigation_enabled = True
+                    self._navigation_enable_pending = False
+
+        return navigation_enabled
+
     @rpc
     def set_goal(self, goal: PoseStamped) -> bool:
-        self._planner.handle_goal_request(goal)
-        return True
+        return self._handle_goal_request(goal)
 
     @rpc
     def get_state(self) -> NavigationState:

@@ -13,8 +13,8 @@
 # limitations under the License.
 
 from dataclasses import asdict
-import time
 
+from dimos_lcm.std_msgs import Bool
 import numpy as np
 from pydantic import Field
 from reactivex import combine_latest, operators as ops
@@ -29,9 +29,6 @@ from dimos.mapping.pointclouds.occupancy import (
 )
 from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
-from dimos.utils.logging_config import setup_logger
-
-logger = setup_logger()
 
 
 class Config(ModuleConfig):
@@ -46,38 +43,25 @@ class CostMapper(Module):
     global_map: In[PointCloud2]
     merged_map: In[PointCloud2]
     global_costmap: Out[OccupancyGrid]
+    merged_costmap_ready: Out[Bool]
 
     @rpc
     def start(self) -> None:
         super().start()
 
-        def _select_map(
-            pair: tuple[PointCloud2, PointCloud2 | None],
-        ) -> PointCloud2:
-            gmap, merged = pair
-            return merged if merged is not None else gmap
-
-        def _publish_costmap(grid: OccupancyGrid, calc_time_ms: float, rx_monotonic: float) -> None:
-            self.global_costmap.publish(grid)
-
-        def _calculate_and_time(
-            msg: PointCloud2,
-        ) -> tuple[OccupancyGrid, float, float]:
-            rx_monotonic = time.monotonic()  # Capture receipt time
-            start = time.perf_counter()
-            grid = self._calculate_costmap(msg)
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            return grid, elapsed_ms, rx_monotonic
-
         self.register_disposable(
             combine_latest(
                 self.global_map.observable(),  # type: ignore[no-untyped-call]
                 self.merged_map.observable().pipe(ops.start_with(None)),  # type: ignore[no-untyped-call,arg-type]
-            )
-            .pipe(ops.map(_select_map))
-            .pipe(ops.map(_calculate_and_time))
-            .subscribe(lambda result: _publish_costmap(result[0], result[1], result[2]))
+            ).subscribe(self._on_map_pair)
         )
+
+    def _on_map_pair(self, pair: tuple[PointCloud2, PointCloud2 | None]) -> None:
+        global_map, merged_map = pair
+        grid = self._calculate_costmap(merged_map if merged_map is not None else global_map)
+        self.global_costmap.publish(grid)
+        if merged_map is not None:
+            self.merged_costmap_ready.publish(Bool(True))
 
     @rpc
     def stop(self) -> None:
