@@ -92,6 +92,8 @@ class PointLioConfig(NativeModuleConfig):
 
     pointcloud_freq: float = 10.0
     odom_freq: float = 30.0
+    scan_publish_en: bool = True
+    deskewed_scan_publish_en: bool = False
 
     debug: bool = False
 
@@ -169,7 +171,13 @@ class PointLio(NativeModule, perception.Lidar, perception.Odometry):
     config: PointLioConfig
 
     lidar: Out[PointCloud2]
+    # Downsampled endpoints registered at each point group's sensor time, then
+    # expressed in the final LiDAR frame. Use with lidar_odometry as one pair.
+    deskewed_lidar: Out[PointCloud2]
     odometry: Out[Odometry]
+    # Exact companion pose for deskewed_lidar. Twist and covariance retain the
+    # Point-LIO estimator convention; mapping consumers use pose and timestamp.
+    lidar_odometry: Out[Odometry]
 
     @rpc
     def start(self) -> None:
