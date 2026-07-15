@@ -14,11 +14,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from functools import partial
 import math
 from pathlib import Path
+import shutil
 import subprocess
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import rerun as rr
 import rerun.blueprint as rrb
@@ -28,6 +30,9 @@ import typer
 # deferred into the function bodies below so that `dimos --help` — which imports this
 # module just to register the `map` subcommand — stays fast. See test_cli_startup.py.
 if TYPE_CHECKING:
+    import numpy as np
+    from numpy.typing import NDArray
+
     from dimos.mapping.loop_closure.pgo import PoseGraph
     from dimos.memory2.stream import Stream
     from dimos.memory2.type.observation import Observation
@@ -44,6 +49,8 @@ MARKER_STEM = 1.0
 # Conventional world frames tried in order when --frame isn't given.
 _WORLD_FRAMES = ("world", "map", "odom")
 
+RegistrationMode = Literal["tf", "observation-pose"]
+
 
 def _detect_world(tf_buf: Any, cloud_frame: str, ts: float) -> str | None:
     """Pick the first conventional world frame that resolves the cloud frame via tf."""
@@ -54,6 +61,230 @@ def _detect_world(tf_buf: Any, cloud_frame: str, ts: float) -> str | None:
             if tf_buf.get(cand, cloud_frame, time_point=ts) is not None:
                 return cand
     return None
+
+
+def _observation_pose_transform(
+    obs: Observation[Any], *, world_frame: str, child_frame: str | None = None
+) -> Transform | None:
+    """Return the exact sensor pose stored on an observation.
+
+    A missing pose or an uninitialized/non-finite quaternion is not a usable
+    registration. The world origin is valid and must not be mistaken for a
+    placeholder pose.
+    """
+    from dimos.msgs.geometry_msgs.Quaternion import Quaternion
+    from dimos.msgs.geometry_msgs.Transform import Transform
+    from dimos.msgs.geometry_msgs.Vector3 import Vector3
+
+    pose = obs.pose_tuple
+    if pose is None or not all(math.isfinite(value) for value in pose):
+        return None
+    x, y, z, qx, qy, qz, qw = pose
+    if qx * qx + qy * qy + qz * qz + qw * qw < 1e-12:
+        return None
+    return Transform(
+        translation=Vector3(x, y, z),
+        rotation=Quaternion(qx, qy, qz, qw),
+        frame_id=world_frame,
+        child_frame_id=child_frame or obs.data.frame_id,
+        ts=obs.ts,
+    )
+
+
+def _resolve_registration(
+    first_obs: Observation[PointCloud2] | None,
+    *,
+    mode: RegistrationMode,
+    requested_world: str | None,
+    tf_buf: Any,
+    tf_tolerance: float | None,
+) -> tuple[str, str | None, Callable[[Observation[Any]], Transform | None] | None]:
+    """Resolve the world frame and cloud registration strategy.
+
+    The returned callback only transforms sensor-frame clouds. A ``None``
+    callback means the input cloud is already expressed in the selected world
+    frame.
+    """
+    cloud_frame = first_obs.data.frame_id if first_obs is not None else None
+
+    if mode == "observation-pose":
+        if requested_world is None:
+            raise ValueError(
+                "--frame is required with --registration=observation-pose because "
+                "Observation.pose does not store its parent frame"
+            )
+        if cloud_frame is None or cloud_frame == requested_world:
+            return requested_world, cloud_frame, None
+        return (
+            requested_world,
+            cloud_frame,
+            partial(
+                _observation_pose_transform,
+                world_frame=requested_world,
+                child_frame=cloud_frame,
+            ),
+        )
+
+    world = requested_world
+    if world is None and first_obs is not None and cloud_frame is not None:
+        world = _detect_world(tf_buf, cloud_frame, first_obs.ts)
+        if world is None:
+            frames = tf_buf.get_frames() if tf_buf is not None else set()
+            known = ", ".join(sorted(frames)) or "dataset has no tf stream"
+            raise ValueError(
+                f"none of {', '.join(_WORLD_FRAMES)} resolves {cloud_frame!r} clouds; "
+                f"pass --frame (tf frames: {known})"
+            )
+    if world is None:
+        world = "world"
+    if first_obs is None or cloud_frame is None or cloud_frame == world:
+        return world, cloud_frame, None
+
+    probe = tf_buf.get(world, cloud_frame, time_point=first_obs.ts) if tf_buf is not None else None
+    if probe is None:
+        frames = tf_buf.get_frames() if tf_buf is not None else set()
+        known = ", ".join(sorted(frames)) or "dataset has no tf stream"
+        raise ValueError(
+            f"cannot register {cloud_frame!r} clouds into {world!r} (tf frames: {known})"
+        )
+
+    def register_from_tf(obs: Observation[Any]) -> Transform | None:
+        return cast(
+            "Transform | None",
+            tf_buf.get(
+                world,
+                cloud_frame,
+                time_point=obs.ts,
+                time_tolerance=tf_tolerance,
+            ),
+        )
+
+    return world, cloud_frame, register_from_tf
+
+
+def _trajectory_position(
+    obs: Observation[Any],
+    *,
+    mode: RegistrationMode,
+    world_frame: str,
+    child_frame: str,
+    register: Callable[[Observation[Any]], Transform | None] | None,
+) -> tuple[float, float, float] | None:
+    """Return the world-frame sensor position used by paths and deduplication."""
+    tf = (
+        register(obs)
+        if mode == "tf" and register is not None
+        else _observation_pose_transform(
+            obs,
+            world_frame=world_frame,
+            child_frame=child_frame,
+        )
+    )
+    if tf is None:
+        return None
+    return (tf.translation.x, tf.translation.y, tf.translation.z)
+
+
+def _observation_pose_registered(
+    obs_iter: Iterator[Observation[PointCloud2]],
+    *,
+    world_frame: str,
+    child_frame: str,
+) -> Iterator[Observation[PointCloud2]]:
+    """Yield valid observation-pose clouds in the world frame for PGO."""
+    for obs in obs_iter:
+        tf = _observation_pose_transform(
+            obs,
+            world_frame=world_frame,
+            child_frame=child_frame,
+        )
+        if tf is None:
+            continue
+        yield obs if obs.data.frame_id == world_frame else obs.derive(data=obs.data.transform(tf))
+
+
+def _prepare_raytrace_frame(
+    obs: Observation[PointCloud2],
+    *,
+    world_frame: str,
+    graph: PoseGraph | None,
+    register: Callable[[Observation[Any]], Transform | None] | None,
+) -> tuple[NDArray[np.float32], tuple[float, float, float]] | None:
+    """Prepare corrected world endpoints and their matching sensor origin."""
+    import numpy as np
+
+    if len(obs.data) == 0:
+        return None
+
+    sensor_pose = (
+        register(obs)
+        if register is not None
+        else _observation_pose_transform(obs, world_frame=world_frame)
+    )
+    if sensor_pose is None:
+        return None
+
+    correction = graph.correction_at(obs.ts) if graph is not None else None
+    corrected_pose = sensor_pose if correction is None else correction + sensor_pose
+    points = obs.data.points_f32()
+    endpoint_tf = corrected_pose if register is not None else correction
+    if endpoint_tf is not None:
+        matrix = endpoint_tf.to_matrix()
+        rotation = matrix[:3, :3].astype(np.float32)
+        translation = matrix[:3, 3].astype(np.float32)
+        points = points @ rotation.T + translation
+
+    origin = corrected_pose.translation
+    return points, (origin.x, origin.y, origin.z)
+
+
+def _raytrace_accumulate(
+    obs_iter: Iterable[Observation[PointCloud2]],
+    *,
+    voxel: float,
+    world_frame: str,
+    graph: PoseGraph | None,
+    register: Callable[[Observation[Any]], Transform | None] | None,
+    progress_cb: Callable[[Observation[Any]], None] | None = None,
+) -> PointCloud2 | None:
+    """Rebuild a map by replaying every frame through the ray tracer.
+
+    ``register`` supplies the raw-world sensor pose for sensor-frame clouds.
+    PGO drift correction is composed onto both hit endpoints and ray origins.
+    Already-world-frame clouds still require ``obs.pose`` because ray tracing
+    cannot clear free space without a sensor origin.
+    """
+    from dimos.mapping.ray_tracing.voxel_map import VoxelRayMapper
+    from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
+
+    mapper = VoxelRayMapper(voxel_size=voxel, max_range=30.0)
+    last_ts: float | None = None
+    frame_count = 0
+
+    for obs in obs_iter:
+        if progress_cb is not None:
+            progress_cb(obs)
+        prepared = _prepare_raytrace_frame(
+            obs,
+            world_frame=world_frame,
+            graph=graph,
+            register=register,
+        )
+        if prepared is None:
+            continue
+        points, origin = prepared
+        mapper.add_frame(points, origin)
+        last_ts = obs.ts
+        frame_count += 1
+
+    if last_ts is None:
+        return None
+    print(f"raytrace: replayed {frame_count} posed frames")
+    return PointCloud2.from_numpy(
+        mapper.global_map(),
+        frame_id=world_frame,
+        timestamp=last_ts,
+    )
 
 
 def _log_markers(
@@ -342,10 +573,16 @@ def main(
     frame: str | None = typer.Option(
         None,
         "--frame",
-        help="World frame to register clouds into. Default: auto-detect — the "
-        "first of 'world', 'map', 'odom' that resolves the cloud frame via the "
-        "dataset's tf stream. Clouds whose frame_id differs from it are "
-        "registered via tf; clouds already in it pass through verbatim.",
+        help="World frame to register clouds into. In --registration=tf mode, "
+        "the default is auto-detected from tf. In observation-pose mode this "
+        "is required because stored poses do not encode their parent frame.",
+    ),
+    registration: RegistrationMode = typer.Option(
+        "tf",
+        "--registration",
+        help="Cloud registration source: 'tf' preserves the existing nearest-tf "
+        "workflow; 'observation-pose' uses only the exact pose stored on each "
+        "cloud observation and requires --frame.",
     ),
     tf_tolerance: float | None = typer.Option(
         None,
@@ -359,6 +596,12 @@ def main(
         help="Column carving: keep only the latest frame's points per (X,Y) column. "
         "Off by default (full 3D accumulation); on collapses vertical structure "
         "(stairs, revisited columns) to the most recent observation.",
+    ),
+    raytrace: bool = typer.Option(
+        False,
+        "--raytrace",
+        help="With --registration=observation-pose, replay every frame through "
+        "raycast clearing after PGO. Implies --pgo.",
     ),
     markers: bool = typer.Option(
         False,
@@ -427,7 +670,13 @@ def main(
     store = open_store(db_path)
     if out is None:
         out = Path.cwd() / f"{db_path.stem}.rrd"
-    if export or full_pgo:
+    if raytrace and registration != "observation-pose":
+        raise typer.BadParameter(
+            "--raytrace requires --registration=observation-pose so endpoints "
+            "and sensor origins use the same exact snapshot pose",
+            param_hint="--raytrace",
+        )
+    if export or full_pgo or raytrace:
         pgo = True
 
     lidar = store.stream(lidar_stream, PointCloud2).from_time(seek or None).to_time(duration)
@@ -436,82 +685,56 @@ def main(
 
     total = lidar.count()
 
-    # Register clouds into the world frame via the dataset's tf stream. Clouds
-    # already stamped with the world frame pass through verbatim; sensor-frame
-    # clouds with no tf lookup are dropped. Stored per-frame poses are never
-    # used for registration — only as trajectory metadata (dedup/path) when
-    # the tf stream can't provide a position.
     from dimos.memory2.tf import StreamTF
 
-    tf_buf = StreamTF.from_store(store)
-    # Streams are homogeneous: read the cloud frame from the first observation.
     first_obs = next(iter(lidar), None)
-    cloud_frame: str | None = first_obs.data.frame_id if first_obs is not None else None
-
-    world = frame
-    if world is None and first_obs is not None and cloud_frame is not None:
-        world = _detect_world(tf_buf, cloud_frame, first_obs.ts)
-        if world is None:
-            frames = tf_buf.get_frames() if tf_buf is not None else set()
-            known = ", ".join(sorted(frames)) or "dataset has no tf stream"
-            raise typer.BadParameter(
-                f"none of {', '.join(_WORLD_FRAMES)} resolves {cloud_frame!r} clouds; "
-                f"pass --frame (tf frames: {known})",
-                param_hint="--frame",
-            )
-    if world is None:
-        world = "world"  # empty lidar stream; the frame is moot
-
-    # Registration: sensor-frame clouds get a per-frame tf lookup lifting them
-    # into the world frame (frames with no tf answer are dropped); clouds
-    # already stamped with the world frame accumulate verbatim (register=None).
-    register: Callable[[Observation[Any]], Transform | None] | None = None
-    if first_obs is not None and cloud_frame is not None and cloud_frame != world:
-        # Fail fast when registration is impossible: probe the first cloud's
-        # timestamp (unbounded tolerance — "possible at all", not "in range").
-        probe = (
-            tf_buf.get(world, cloud_frame, time_point=first_obs.ts) if tf_buf is not None else None
+    tf_buf = StreamTF.from_store(store) if registration == "tf" else None
+    try:
+        world, cloud_frame, register = _resolve_registration(
+            first_obs,
+            mode=registration,
+            requested_world=frame,
+            tf_buf=tf_buf,
+            tf_tolerance=tf_tolerance,
         )
-        if tf_buf is None or probe is None:
-            frames = tf_buf.get_frames() if tf_buf is not None else set()
-            known = ", ".join(sorted(frames)) or "dataset has no tf stream"
-            raise typer.BadParameter(
-                f"cannot register {cloud_frame!r} clouds into {world!r} (tf frames: {known})",
-                param_hint="--frame",
-            )
-        print(f"registering clouds {world!r} ← {cloud_frame!r} via tf")
-        buf = tf_buf
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--frame") from exc
 
-        def _register(obs: Observation[Any]) -> Transform | None:
-            return buf.get(world, obs.data.frame_id, time_point=obs.ts, time_tolerance=tf_tolerance)
-
-        register = _register
-    elif cloud_frame is not None:
-        print(f"clouds already in world frame {world!r}; accumulating verbatim")
-        print("warning: trajectory positions come from stored obs.pose (old dataset)")
-
-    def _position(obs: Observation[Any]) -> tuple[float, float, float] | None:
-        """Trajectory position for dedup/path: registration tf, else the stored pose."""
-        if register is not None:
-            tf = register(obs)
-            if tf is None:
-                return None
-            return (tf.translation.x, tf.translation.y, tf.translation.z)
-        pose = obs.pose
-        # Reject placeholder poses: zero translation OR uninitialized rotation.
-        # Same condition as pgo_keyframes so dedup and PGO see the same frames.
-        if pose is not None and not (pose.position.is_zero() or pose.orientation.is_zero()):
-            return (pose.position.x, pose.position.y, pose.position.z)
-        return None
+    sensor_frame = cloud_frame or "sensor"
+    if cloud_frame is not None:
+        if registration == "observation-pose":
+            if register is None:
+                print(
+                    f"clouds already in world frame {world!r}; using exact observation "
+                    "poses as ray origins (no tf fallback)"
+                )
+            else:
+                print(
+                    f"registering clouds {world!r} ← {sensor_frame!r} via exact "
+                    "observation pose (no tf fallback)"
+                )
+        elif register is not None:
+            print(f"registering clouds {world!r} ← {cloud_frame!r} via tf")
+        else:
+            print(f"clouds already in world frame {world!r}; accumulating verbatim")
+            print("warning: trajectory positions come from stored obs.pose (old dataset)")
 
     # Spatial dedup: bucket frames by 3D cell using the trajectory position,
     # keep the latest per cell. Shared by raw and PGO rebuilds. Doesn't touch
     # obs.data so it stays cheap (no pointcloud loading). With pgo_tol<=0 the
     # bucketing is disabled and every positioned frame is kept (keyed by index).
     seen: dict[Any, tuple[Observation[Any], tuple[float, float, float]]] = {}
+    unregistered = 0
     for i, obs in enumerate(lidar):
-        pos = _position(obs)
+        pos = _trajectory_position(
+            obs,
+            mode=registration,
+            world_frame=world,
+            child_frame=sensor_frame,
+            register=register,
+        )
         if pos is None:
+            unregistered += 1
             continue
         if pgo_tol > 0:
             # math.floor so negative coords bucket consistently; int() truncates
@@ -531,6 +754,16 @@ def main(
         print(f"dedup: kept [{n_kept}/{total}] frames ({pct:.1f}%) at tol={pgo_tol}m")
     else:
         print(f"dedup: disabled, kept all [{n_kept}/{total}] positioned frames")
+    if unregistered and registration == "observation-pose":
+        print(
+            f"registration: dropped {unregistered}/{total} frames without valid observation poses"
+        )
+    if registration == "observation-pose" and total > 0 and n_kept == 0:
+        raise typer.BadParameter(
+            f"none of the {total} lidar observations has a valid stored pose; "
+            "observation-pose registration never falls back to tf",
+            param_hint="--registration",
+        )
 
     # Dict insertion order = lidar iteration order = chronological.
     kept = [obs for obs, _ in seen.values()]
@@ -542,39 +775,76 @@ def main(
     if pgo:
         print("running PGO twopass map...")
         with progress(total, "pgo pass 1 (optimizing)") as bar:
-            graph = lidar.tap(bar).transform(PGO()).last().data
+            pgo_input = lidar.tap(bar)
+            # PGO consumes world-frame endpoints and unregisters them with the
+            # stored pose internally. Keep legacy tf mode unchanged; exact
+            # observation-pose mode prepares both inputs from the same pose.
+            if registration == "observation-pose":
+                pgo_input = pgo_input.transform(
+                    lambda upstream: _observation_pose_registered(
+                        upstream,
+                        world_frame=world,
+                        child_frame=sensor_frame,
+                    )
+                )
+            try:
+                graph = pgo_input.transform(PGO()).last().data
+            except LookupError as exc:
+                if registration == "tf":
+                    raise
+                raise typer.BadParameter(
+                    "PGO found no usable posed lidar frames",
+                    param_hint="--pgo",
+                ) from exc
 
         pgo_path = [
             (kf.optimized.translation.x, kf.optimized.translation.y, kf.optimized.translation.z)
             for kf in graph.keyframes
         ]
 
-        with progress(n_kept, "pgo pass 2 (rebuilding)") as bar:
-            pgo_map = _accumulate(
-                kept,
-                voxel=voxel,
-                block_count=block_count,
-                device=device,
-                graph=graph,
-                register=register,
-                carve_columns=carve,
-                progress_cb=bar,
-            )
+        if raytrace:
+            with progress(total, "pgo pass 2 (raytracing)") as bar:
+                # Ray clearing is temporal, so replay every frame in order;
+                # spatially deduped frames are only appropriate for occupancy
+                # accumulation, not free-space evidence.
+                pgo_map = _raytrace_accumulate(
+                    lidar,
+                    voxel=voxel,
+                    world_frame=world,
+                    graph=graph,
+                    register=register,
+                    progress_cb=bar,
+                )
+        else:
+            with progress(n_kept, "pgo pass 2 (rebuilding)") as bar:
+                pgo_map = _accumulate(
+                    kept,
+                    voxel=voxel,
+                    block_count=block_count,
+                    device=device,
+                    graph=graph,
+                    register=register,
+                    carve_columns=carve,
+                    progress_cb=bar,
+                )
 
     full_pgo_map = None
     if full_pgo:
         assert graph is not None
-        with progress(total, "full pgo (rebuilding)") as bar:
-            full_pgo_map = _accumulate(
-                lidar,
-                voxel=voxel,
-                block_count=block_count,
-                device=device,
-                graph=graph,
-                register=register,
-                carve_columns=carve,
-                progress_cb=bar,
-            )
+        if raytrace:
+            print("full pgo: omitted because --raytrace already replays every frame")
+        else:
+            with progress(total, "full pgo (rebuilding)") as bar:
+                full_pgo_map = _accumulate(
+                    lidar,
+                    voxel=voxel,
+                    block_count=block_count,
+                    device=device,
+                    graph=graph,
+                    register=register,
+                    carve_columns=carve,
+                    progress_cb=bar,
+                )
 
     # Raw map: same dedup'd frames, no PGO correction.
     with progress(n_kept, "reconstructing global map") as bar:
@@ -661,11 +931,8 @@ def main(
         marker_size=marker_size,
         bottom_cutoff=bottom_cutoff,
     )
+    rr.rerun_shutdown()
     print(f"wrote {out}")
-    if no_gui:
-        print(f"open with: rerun {out}")
-    else:
-        subprocess.Popen(["rerun", str(out)])
 
     if export and pgo_map is not None:
         out_path = Path.cwd() / f"{db_path.stem}.pc2.lcm"
@@ -676,6 +943,13 @@ def main(
         print("load back with:")
         print("    from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2")
         print(f'    pcd = PointCloud2.lcm_decode(open("{out_path.name}", "rb").read())')
+
+    if no_gui:
+        print(f"open with: rerun {out}")
+    elif rerun := shutil.which("rerun"):
+        subprocess.Popen([rerun, str(out)])
+    else:
+        print(f"rerun viewer not found on PATH; open manually:\n    rerun {out}")
 
 
 if __name__ == "__main__":
