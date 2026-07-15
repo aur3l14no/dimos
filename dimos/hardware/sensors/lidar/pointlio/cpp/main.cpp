@@ -75,7 +75,9 @@ static std::vector<double> parse_doubles(const std::string& csv) {
 }
 
 static std::string g_lidar_topic;
+static std::string g_deskewed_lidar_topic;
 static std::string g_odometry_topic;
+static std::string g_lidar_odometry_topic;
 static std::string g_frame_id;          // required via --frame_id
 static std::string g_sensor_frame_id;    // required via --sensor_frame_id
 static float g_frequency = 10.0f;
@@ -102,12 +104,14 @@ static uint64_t get_timestamp_ns(const LivoxLidarEthernetPacket* pkt) {
 using dimos::time_from_seconds;
 using dimos::make_header;
 
-// Publish the lidar point cloud in the sensor frame (g_sensor_frame_id).
-// `cloud` is Point-LIO's undistorted scan in the sensor's own frame
-// (get_body_cloud), so points are published as-is with no world registration.
-static void publish_lidar(PointCloudXYZI::Ptr cloud, double timestamp, const std::string& topic = "") {
-    const std::string& chan = topic.empty() ? g_lidar_topic : topic;
-    if (!g_lcm || !cloud || cloud->empty() || chan.empty()) { return; }
+// Publish a Point-LIO cloud expressed in g_sensor_frame_id. Both the legacy
+// body cloud and the coherent deskewed cloud satisfy this frame contract.
+static void publish_lidar(
+    PointCloudXYZI::Ptr cloud,
+    double timestamp,
+    const std::string& topic
+) {
+    if (!g_lcm || !cloud || cloud->empty() || topic.empty()) { return; }
 
     int num_points = static_cast<int>(cloud->size());
 
@@ -149,11 +153,15 @@ static void publish_lidar(PointCloudXYZI::Ptr cloud, double timestamp, const std
         dst[3] = cloud->points[point_idx].intensity;
     }
 
-    g_lcm->publish(chan, &pc);
+    g_lcm->publish(topic, &pc);
 }
 
-static void publish_odometry(const custom_messages::Odometry& odom, double timestamp) {
-    if (!g_lcm) { return; }
+static void publish_odometry(
+    const custom_messages::Odometry& odom,
+    double timestamp,
+    const std::string& topic
+) {
+    if (!g_lcm || topic.empty()) { return; }
 
     nav_msgs::Odometry msg;
     msg.header = make_header(g_frame_id, timestamp);
@@ -181,7 +189,7 @@ static void publish_odometry(const custom_messages::Odometry& odom, double times
     msg.twist.twist.angular.z = odom.twist.twist.angular.z;
     std::memset(msg.twist.covariance, 0, sizeof(msg.twist.covariance));
 
-    g_lcm->publish(g_odometry_topic, &msg);
+    g_lcm->publish(topic, &msg);
 }
 
 
@@ -302,10 +310,15 @@ int main(int argc, char** argv) {
     dimos::NativeModule mod(argc, argv);
 
     g_lidar_topic = mod.has("lidar") ? mod.topic("lidar") : "";
+    g_deskewed_lidar_topic =
+        mod.has("deskewed_lidar") ? mod.topic("deskewed_lidar") : "";
     g_odometry_topic = mod.has("odometry") ? mod.topic("odometry") : "";
+    g_lidar_odometry_topic =
+        mod.has("lidar_odometry") ? mod.topic("lidar_odometry") : "";
 
-    if (g_lidar_topic.empty() && g_odometry_topic.empty()) {
-        fprintf(stderr, "Error: at least one of --lidar or --odometry is required\n");
+    if (g_lidar_topic.empty() && g_deskewed_lidar_topic.empty() &&
+        g_odometry_topic.empty() && g_lidar_odometry_topic.empty()) {
+        fprintf(stderr, "Error: at least one output topic is required\n");
         return 1;
     }
 
@@ -384,6 +397,16 @@ int main(int argc, char** argv) {
     g_sensor_frame_id = mod.arg_required("sensor_frame_id");
     float pointcloud_freq = mod.arg_float("pointcloud_freq", 5.0f);
     float odom_freq = mod.arg_float("odom_freq", 50.0f);
+    bool scan_publish_en = mod.arg_bool("scan_publish_en", true);
+    bool deskewed_scan_publish_en = mod.arg_bool("deskewed_scan_publish_en", false);
+    if (deskewed_scan_publish_en &&
+        (g_deskewed_lidar_topic.empty() || g_lidar_odometry_topic.empty())) {
+        fprintf(
+            stderr,
+            "Error: deskewed scan output requires --deskewed_lidar and --lidar_odometry\n"
+        );
+        return 1;
+    }
 
     // Propagates to the Point-LIO core via the `pointlio_debug` global.
     bool debug = mod.arg_bool("debug", false);
@@ -406,7 +429,9 @@ int main(int argc, char** argv) {
     if (debug) {
         printf("[pointlio] Starting Point-LIO + Livox Mid-360 native module\n");
         printf("[pointlio] lidar topic: %s\n", g_lidar_topic.empty() ? "(disabled)" : g_lidar_topic.c_str());
+        printf("[pointlio] deskewed lidar topic: %s\n", g_deskewed_lidar_topic.empty() ? "(disabled)" : g_deskewed_lidar_topic.c_str());
         printf("[pointlio] odometry topic: %s\n", g_odometry_topic.empty() ? "(disabled)" : g_odometry_topic.c_str());
+        printf("[pointlio] lidar odometry topic: %s\n", g_lidar_odometry_topic.empty() ? "(disabled)" : g_lidar_odometry_topic.c_str());
         printf("[pointlio] tuning: filter_size_surf=%.3f ivox_res=%.3f lidar_type=%d\n", params.filter_size_surf, params.ivox_grid_resolution, params.lidar_type);
         printf("[pointlio] host_ip: %s  lidar_ip: %s  frequency: %.1f Hz\n", host_ip.c_str(), lidar_ip.c_str(), g_frequency);
         printf("[pointlio] pointcloud_freq: %.1f Hz  odom_freq: %.1f Hz\n", pointcloud_freq, odom_freq);
@@ -468,56 +493,85 @@ int main(int argc, char** argv) {
                 last_emit = now;
             }
         }
-        // Serialize EKF access against the SDK IMU callback (on_imu_data) for the
-        // rest of the iteration — feed_lidar/process/get_* all touch the estimator.
-        std::lock_guard<std::mutex> lio_lock(g_lio_mutex);
-        if (!points.empty()) {
-            const size_t num_points = points.size();
-            auto lidar_msg = boost::make_shared<custom_messages::CustomMsg>();
-            lidar_msg->header.seq = 0;
-            lidar_msg->header.stamp = custom_messages::Time().fromSec( static_cast<double>(frame_start) / 1e9);
-            lidar_msg->header.frame_id = "livox_frame";
-            lidar_msg->timebase = frame_start;
-            lidar_msg->lidar_id = 0;
-            for (int idx = 0; idx < 3; idx++) { lidar_msg->rsvd[idx] = 0; }
-            lidar_msg->point_num = static_cast<uli>(num_points);
-            lidar_msg->points = std::move(points);
-            if (pointlio_debug) {
-                fprintf(stderr, "[pointlio] feed_lidar frame: %zu points\n", num_points);
+        PointCloudXYZI::Ptr legacy_cloud;
+        DeskewedLidarSnapshot deskewed_snapshot;
+        custom_messages::Odometry legacy_odometry;
+        bool odometry_due = false;
+        {
+            // Serialize estimator access against the SDK IMU callback. Copy a
+            // coherent result under the lock, then encode and publish it after
+            // releasing the lock so packet ingestion is not blocked by LCM.
+            std::lock_guard<std::mutex> lio_lock(g_lio_mutex);
+            if (!points.empty()) {
+                const size_t num_points = points.size();
+                auto lidar_msg = boost::make_shared<custom_messages::CustomMsg>();
+                lidar_msg->header.seq = 0;
+                lidar_msg->header.stamp = custom_messages::Time().fromSec(
+                    static_cast<double>(frame_start) / 1e9
+                );
+                lidar_msg->header.frame_id = "livox_frame";
+                lidar_msg->timebase = frame_start;
+                lidar_msg->lidar_id = 0;
+                for (int idx = 0; idx < 3; idx++) { lidar_msg->rsvd[idx] = 0; }
+                lidar_msg->point_num = static_cast<uli>(num_points);
+                lidar_msg->points = std::move(points);
+                if (pointlio_debug) {
+                    fprintf(stderr, "[pointlio] feed_lidar frame: %zu points\n", num_points);
+                }
+                point_lio.feed_lidar(lidar_msg);
             }
-            point_lio.feed_lidar(lidar_msg);
+
+            // Getters retain the previous estimator result. process() is the
+            // authoritative gate that prevents publishing it more than once.
+            if (!point_lio.process()) { return; }
+
+            const bool legacy_cloud_enabled = scan_publish_en && !g_lidar_topic.empty();
+            const bool deskewed_cloud_enabled =
+                deskewed_scan_publish_en && !g_deskewed_lidar_topic.empty();
+            const bool cloud_due = (legacy_cloud_enabled || deskewed_cloud_enabled) &&
+                now - *last_pc_publish >= pc_interval;
+            odometry_due = !g_odometry_topic.empty() &&
+                now - *last_odom_publish >= odom_interval;
+
+            if (cloud_due && legacy_cloud_enabled) {
+                legacy_cloud = point_lio.get_body_cloud();
+            }
+            if (cloud_due && deskewed_cloud_enabled) {
+                deskewed_snapshot = point_lio.get_deskewed_lidar_snapshot();
+            }
+            if (odometry_due) {
+                legacy_odometry = point_lio.get_odometry();
+            }
         }
 
-        // One Point-LIO IESKF step (cheap when queues empty).
-        point_lio.process();
+        const bool has_legacy_cloud = legacy_cloud && !legacy_cloud->empty();
+        const bool has_deskewed_cloud =
+            deskewed_snapshot.cloud && !deskewed_snapshot.cloud->empty();
+        const double timestamp = get_publish_ts();
 
-        auto pose = point_lio.get_pose();
-        if (!pose.empty() && (pose[0] != 0.0 || pose[1] != 0.0 || pose[2] != 0.0)) {
-            double ts = get_publish_ts();
-
-            const bool lidar_due = !g_lidar_topic.empty() && now - *last_pc_publish >= pc_interval;
-
-            // get_body_cloud is the loop's costliest step, so build it only when
-            // a publish is due.
-            if (lidar_due) {
-                auto body_cloud = point_lio.get_body_cloud();
-                if (body_cloud && !body_cloud->empty()) {
-                    publish_lidar(body_cloud, ts);
-                    last_pc_publish = now;
-                    if (pointlio_debug) {
-                        fprintf(stderr, "[pointlio] publish lidar: %zu points  pose=(%.3f, %.3f, %.3f)\n", body_cloud->size(), pose[0], pose[1], pose[2]);
-                    }
-                }
-            }
-
-            // Pose + covariance at odom_freq.
-            if (!g_odometry_topic.empty() && now - *last_odom_publish >= odom_interval) {
-                publish_odometry(point_lio.get_odometry(), ts);
-                last_odom_publish = now;
-                if (pointlio_debug) {
-                    fprintf(stderr, "[pointlio] publish odom: pose=(%.3f, %.3f, %.3f)\n", pose[0], pose[1], pose[2]);
-                }
-            }
+        if (has_legacy_cloud) {
+            publish_lidar(legacy_cloud, timestamp, g_lidar_topic);
+        }
+        if (has_deskewed_cloud) {
+            // Publish the exact companion pose first. Both messages use this
+            // one timestamp and were copied from the same estimator result.
+            publish_odometry(
+                deskewed_snapshot.lidar_odometry,
+                timestamp,
+                g_lidar_odometry_topic
+            );
+            publish_lidar(
+                deskewed_snapshot.cloud,
+                timestamp,
+                g_deskewed_lidar_topic
+            );
+        }
+        if (has_legacy_cloud || has_deskewed_cloud) {
+            last_pc_publish = now;
+        }
+        if (odometry_due) {
+            publish_odometry(legacy_odometry, timestamp, g_odometry_topic);
+            last_odom_publish = now;
         }
     };
 
