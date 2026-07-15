@@ -61,9 +61,15 @@ impl<T> Default for LatestSlot<T> {
 }
 
 impl<T> LatestSlot<T> {
-    fn replace(&self, value: T) {
-        *self.pending.lock().expect("latest slot mutex") = Some(value);
+    fn replace(&self, value: T) -> bool {
+        let replaced = self
+            .pending
+            .lock()
+            .expect("latest slot mutex")
+            .replace(value)
+            .is_some();
         self.wake.notify_one();
+        replaced
     }
 
     async fn next(&self) -> T {
@@ -202,7 +208,12 @@ impl RayTracingVoxelMap {
         }
 
         let cloud = self.pending_cloud.take().expect("cloud checked above");
-        self.latest_job.replace(MapJob { cloud, pose });
+        if self.latest_job.replace(MapJob { cloud, pose }) {
+            warn_throttled!(
+                Duration::from_secs(1),
+                "Ray tracing is busy; replaced the pending cloud with a newer one.",
+            );
+        }
     }
 }
 
@@ -685,7 +696,7 @@ mod tests {
     #[tokio::test]
     async fn latest_slot_handles_pre_notify_and_replaces_while_consumer_is_busy() {
         let slot = Arc::new(LatestSlot::default());
-        slot.replace(1);
+        assert!(!slot.replace(1));
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), slot.next())
                 .await
@@ -705,13 +716,13 @@ mod tests {
             (first, worker_slot.next().await)
         });
 
-        slot.replace(2);
+        assert!(!slot.replace(2));
         tokio::time::timeout(Duration::from_secs(1), started_rx)
             .await
             .expect("consumer should receive the first value")
             .expect("consumer should signal that it is busy");
-        slot.replace(3);
-        slot.replace(4);
+        assert!(!slot.replace(3));
+        assert!(slot.replace(4));
         release_tx
             .send(())
             .expect("busy consumer should remain alive");
