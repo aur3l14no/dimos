@@ -131,16 +131,10 @@ class TestTransformHelpers:
 
 
 def _make_lidar_stream(n_frames: int = 12, points_per_frame: int = 500) -> Stream[PointCloud2]:
-    """Straight-line trajectory along +x with small yaw, random body points.
-
-    Note: `pgo_keyframes` skips poses with zero translation OR identity
-    rotation as placeholders, so we use a constant non-identity yaw.
-    """
+    """Straight-line trajectory along +x with small yaw, random body points."""
     rng = np.random.default_rng(0)
     mem = MemoryStore()
     lidar: Stream[PointCloud2] = mem.stream("lidar", PointCloud2)
-    # Small yaw (~6 deg) -> non-identity quaternion that survives the
-    # placeholder filter.
     q = Rotation.from_euler("z", 0.1).as_quat()  # xyzw
     qx, qy, qz, qw = float(q[0]), float(q[1]), float(q[2]), float(q[3])
     R_world = Rotation.from_euler("z", 0.1).as_matrix()
@@ -156,6 +150,58 @@ def _make_lidar_stream(n_frames: int = 12, points_per_frame: int = 500) -> Strea
 
 
 class TestPipelineEndToEnd:
+    def test_nonfinite_pose_is_skipped_without_rejecting_valid_origin(self) -> None:
+        mem = MemoryStore()
+        lidar: Stream[PointCloud2] = mem.stream("lidar", PointCloud2)
+        cloud = PointCloud2.from_numpy(
+            np.array(
+                [
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float32,
+            )
+        )
+        lidar.append(
+            cloud,
+            ts=1.0,
+            pose=(float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+        )
+        lidar.append(
+            cloud,
+            ts=2.0,
+            pose=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+        )
+
+        graph = lidar.transform(PGO()).last().data
+
+        assert len(graph.keyframes) == 1
+        assert graph.keyframes[0].ts == 2.0
+
+    def test_origin_pose_produces_keyframe(self) -> None:
+        mem = MemoryStore()
+        lidar: Stream[PointCloud2] = mem.stream("lidar", PointCloud2)
+        lidar.append(
+            PointCloud2.from_numpy(
+                np.array(
+                    [
+                        [1.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    dtype=np.float32,
+                )
+            ),
+            ts=1.0,
+            pose=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+        )
+
+        graph = lidar.transform(PGO()).last().data
+
+        assert len(graph.keyframes) == 1
+        assert graph.keyframes[0].local.translation.as_tuple == pytest.approx((0.0, 0.0, 0.0))
+
     def test_straight_line_produces_keyframes(self) -> None:
         lidar = _make_lidar_stream(n_frames=12)
         graph = lidar.transform(PGO()).last().data
