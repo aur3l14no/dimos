@@ -23,6 +23,7 @@ pub type VoxelKey = (i32, i32, i32);
 pub type VoxelHealth = i32;
 
 #[native_config]
+#[derive(Clone)]
 #[validate(schema(function = "validate_health_range"))]
 pub struct Config {
     #[validate(range(exclusive_min = 0.0))]
