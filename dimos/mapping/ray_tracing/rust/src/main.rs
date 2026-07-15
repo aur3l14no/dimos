@@ -31,6 +31,22 @@ struct MapJob {
     cloud: PointCloud2,
     translation: Vector3<f32>,
     rotation: UnitQuaternion<f32>,
+    parent_frame: String,
+}
+
+#[derive(Clone)]
+struct PoseSample {
+    stamp: f64,
+    translation: Vector3<f32>,
+    rotation: UnitQuaternion<f32>,
+    parent_frame: String,
+    child_frame: String,
+}
+
+#[derive(Debug, PartialEq)]
+enum FrameContractError {
+    EmptyParentFrame,
+    CloudFrameMismatch,
 }
 
 struct LatestState<T> {
@@ -121,7 +137,7 @@ struct RayTracingVoxelMap {
     #[config]
     config: Config,
 
-    poses: VecDeque<(f64, Vector3<f32>, UnitQuaternion<f32>)>,
+    poses: VecDeque<PoseSample>,
     latest_job: Arc<LatestSlot<MapJob>>,
     worker: Option<tokio::task::JoinHandle<()>>,
 }
@@ -161,33 +177,40 @@ impl RayTracingVoxelMap {
         self.ensure_worker_running().await;
         let p = &msg.pose.pose.position;
         let q = &msg.pose.pose.orientation;
-        push_pose(
-            &mut self.poses,
-            (
-                time_secs(&msg.header.stamp),
-                Vector3::new(p.x as f32, p.y as f32, p.z as f32),
-                UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
-                    q.w as f32, q.x as f32, q.y as f32, q.z as f32,
-                )),
-            ),
-        );
+        let sample = PoseSample {
+            stamp: time_secs(&msg.header.stamp),
+            translation: Vector3::new(p.x as f32, p.y as f32, p.z as f32),
+            rotation: UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+                q.w as f32, q.x as f32, q.y as f32, q.z as f32,
+            )),
+            parent_frame: msg.header.frame_id,
+            child_frame: msg.child_frame_id,
+        };
+        push_pose(&mut self.poses, sample);
     }
 
     async fn on_lidar(&mut self, msg: PointCloud2) {
         self.ensure_worker_running().await;
-        // Register with the pose nearest the cloud stamp, never a stale one.
-        let Some((translation, rotation)) = nearest_pose(&self.poses, time_secs(&msg.header.stamp))
-        else {
+        let Some(pose) = nearest_pose(&self.poses, time_secs(&msg.header.stamp)) else {
             warn_throttled!(
                 Duration::from_secs(1),
                 "No odometry within tolerance of the cloud stamp, dropped a cloud.",
             );
             return;
         };
+        if let Err(error) = validate_frames(&pose, &msg) {
+            warn_throttled!(
+                Duration::from_secs(1),
+                error = ?error,
+                "Cloud and odometry frames are incompatible; dropped a cloud.",
+            );
+            return;
+        }
         if let Some(replaced_total) = self.latest_job.replace(MapJob {
             cloud: msg,
-            translation,
-            rotation,
+            translation: pose.translation,
+            rotation: pose.rotation,
+            parent_frame: pose.parent_frame,
         }) {
             warn_throttled!(
                 Duration::from_secs(1),
@@ -213,6 +236,29 @@ struct MapState {
     frame_count: u32,
     batch_points: Vec<(f32, f32, f32)>,
     batch_origins: Vec<(f32, f32, f32)>,
+    parent_frame: Option<String>,
+}
+
+impl MapState {
+    /// Reset before accepting points expressed in a different parent frame.
+    /// Returns whether the map was reset.
+    fn prepare_for_parent(&mut self, parent_frame: &str) -> bool {
+        let parent_changed = self
+            .parent_frame
+            .as_deref()
+            .is_some_and(|current| current != parent_frame);
+        if parent_changed {
+            *self = Self {
+                parent_frame: Some(parent_frame.to_string()),
+                ..Self::default()
+            };
+            return true;
+        }
+
+        self.parent_frame
+            .get_or_insert_with(|| parent_frame.to_string());
+        false
+    }
 }
 
 struct MapOutputs {
@@ -265,6 +311,7 @@ impl MapWorker {
             cloud,
             translation,
             rotation,
+            parent_frame,
         } = job;
         let origin = (translation.x, translation.y, translation.z);
         let voxel_size = self.config.voxel_size;
@@ -283,8 +330,9 @@ impl MapWorker {
         if points.is_empty() {
             return None;
         }
+        let parent_changed = state.prepare_for_parent(&parent_frame);
 
-        // Transform sensor-frame points into the world by the odom pose.
+        // Transform sensor-frame points into the odometry parent frame.
         let rot = rotation.to_rotation_matrix();
         let points: Vec<(f32, f32, f32)> = points
             .iter()
@@ -294,7 +342,7 @@ impl MapWorker {
             })
             .collect();
 
-        let out_frame_id = "world";
+        let out_frame_id = parent_frame.as_str();
         let live = update_map(&mut state.map, origin, &points, &self.config);
 
         // The batch only feeds the local region bounds, so skip it when the local
@@ -305,7 +353,8 @@ impl MapWorker {
         }
 
         state.frame_count += 1;
-        let local_due = emit_due(state.frame_count, self.config.emit_every);
+        let local_due =
+            emit_due_or_frame_change(state.frame_count, self.config.emit_every, parent_changed);
         let (bounds, cylinder) = if local_due {
             let margin = self.config.shadow_depth + voxel_size;
             let (cx, cy, radius, z_min, z_max) = batch_local_bounds(
@@ -352,7 +401,12 @@ impl MapWorker {
         };
 
         let stamp = cloud.header.stamp;
-        let global = emit_due(state.frame_count, self.config.global_emit_every).then(|| {
+        let global_due = emit_due_or_frame_change(
+            state.frame_count,
+            self.config.global_emit_every,
+            parent_changed,
+        );
+        let global = global_due.then(|| {
             let points = emit_points(&state.map, voxel_size, None, 0, &live);
             points_to_cloud(&points, out_frame_id, stamp.clone())
         });
@@ -380,6 +434,12 @@ fn emit_due(frame_count: u32, every: u32) -> bool {
     every != 0 && frame_count.is_multiple_of(every)
 }
 
+/// A new coordinate epoch must replace the previously published map without
+/// waiting for the next periodic emission. Zero still disables the output.
+fn emit_due_or_frame_change(frame_count: u32, every: u32, frame_changed: bool) -> bool {
+    every != 0 && (frame_changed || emit_due(frame_count, every))
+}
+
 /// Odometry samples kept for cloud-stamp matching.
 const POSE_BUFFER_LEN: usize = 256;
 
@@ -390,29 +450,32 @@ fn time_secs(t: &Time) -> f64 {
     t.sec as f64 + t.nsec as f64 * 1e-9
 }
 
-/// Append a pose sample, evicting the oldest to keep the buffer bounded.
-fn push_pose(
-    poses: &mut VecDeque<(f64, Vector3<f32>, UnitQuaternion<f32>)>,
-    sample: (f64, Vector3<f32>, UnitQuaternion<f32>),
-) {
+/// Append a pose sample, resetting on a frame epoch change.
+/// Returns whether the history was reset.
+fn push_pose(poses: &mut VecDeque<PoseSample>, sample: PoseSample) -> bool {
+    let frames_changed = poses.front().is_some_and(|current| {
+        current.parent_frame != sample.parent_frame || current.child_frame != sample.child_frame
+    });
+    if frames_changed {
+        poses.clear();
+    }
+
     poses.push_back(sample);
     if poses.len() > POSE_BUFFER_LEN {
         poses.pop_front();
     }
+    frames_changed
 }
 
 /// The buffered pose with the stamp nearest the cloud stamp, within tolerance.
-fn nearest_pose(
-    poses: &VecDeque<(f64, Vector3<f32>, UnitQuaternion<f32>)>,
-    stamp: f64,
-) -> Option<(Vector3<f32>, UnitQuaternion<f32>)> {
+fn nearest_pose(poses: &VecDeque<PoseSample>, stamp: f64) -> Option<PoseSample> {
     let mut best_gap = f64::INFINITY;
     let mut best = None;
-    for &(t, v, q) in poses {
-        let gap = (t - stamp).abs();
+    for pose in poses {
+        let gap = (pose.stamp - stamp).abs();
         if gap < best_gap {
             best_gap = gap;
-            best = Some((v, q));
+            best = Some(pose.clone());
         }
     }
     if best_gap <= POSE_MATCH_TOLERANCE_S {
@@ -420,6 +483,16 @@ fn nearest_pose(
     } else {
         None
     }
+}
+
+fn validate_frames(pose: &PoseSample, cloud: &PointCloud2) -> Result<(), FrameContractError> {
+    if pose.parent_frame.is_empty() {
+        return Err(FrameContractError::EmptyParentFrame);
+    }
+    if !cloud.header.frame_id.is_empty() && cloud.header.frame_id != pose.child_frame {
+        return Err(FrameContractError::CloudFrameMismatch);
+    }
+    Ok(())
 }
 
 struct ExtractError(&'static str);
@@ -572,37 +645,116 @@ mod tests {
         assert_eq!(slot.take(), Some(4));
     }
 
+    fn stamp(milliseconds: i32) -> Time {
+        Time {
+            sec: milliseconds / 1_000,
+            nsec: (milliseconds % 1_000) * 1_000_000,
+        }
+    }
+
+    fn pose(milliseconds: i32, x: f32, parent_frame: &str, child_frame: &str) -> PoseSample {
+        PoseSample {
+            stamp: milliseconds as f64 / 1_000.0,
+            translation: Vector3::new(x, 0.0, 0.0),
+            rotation: UnitQuaternion::identity(),
+            parent_frame: parent_frame.to_string(),
+            child_frame: child_frame.to_string(),
+        }
+    }
+
+    fn cloud(milliseconds: i32, frame_id: &str) -> PointCloud2 {
+        PointCloud2 {
+            header: Header {
+                stamp: stamp(milliseconds),
+                frame_id: frame_id.to_string(),
+                ..Header::default()
+            },
+            ..PointCloud2::default()
+        }
+    }
+
     #[test]
     fn nearest_pose_picks_by_stamp_and_gates_on_tolerance() {
-        let mut poses: VecDeque<(f64, Vector3<f32>, UnitQuaternion<f32>)> = VecDeque::new();
-        for (t, x) in [(1.0, 1.0f32), (2.0, 2.0), (3.0, 3.0)] {
-            poses.push_back((t, Vector3::new(x, 0.0, 0.0), UnitQuaternion::identity()));
-        }
-        let (v, _) = nearest_pose(&poses, 2.04).expect("within tolerance");
-        assert_eq!(v.x, 2.0, "nearest stamp wins, not the latest");
-        assert!(
-            nearest_pose(&poses, 3.5).is_none(),
-            "stale poses must not register a cloud"
-        );
+        let mut poses = VecDeque::new();
+        push_pose(&mut poses, pose(1_950, 1.0, "odom", "lidar"));
+        push_pose(&mut poses, pose(2_000, 2.0, "odom", "lidar"));
+        push_pose(&mut poses, pose(2_080, 3.0, "odom", "lidar"));
+
+        let exact = nearest_pose(&poses, 2.0).expect("exact pose should match");
+        assert_eq!(exact.translation.x, 2.0);
+        let nearest = nearest_pose(&poses, 2.05).expect("nearest pose should match");
+        assert_eq!(nearest.translation.x, 3.0);
+        assert!(nearest_pose(&poses, 3.0).is_none());
         assert!(nearest_pose(&VecDeque::new(), 1.0).is_none());
     }
 
     #[test]
+    fn frame_contract_enforces_parent_and_cloud_frames() {
+        let pointcloud = cloud(1_000, "lidar");
+        let mut sample = pose(1_000, 0.0, "", "lidar");
+        assert_eq!(
+            validate_frames(&sample, &pointcloud),
+            Err(FrameContractError::EmptyParentFrame)
+        );
+
+        sample = pose(1_000, 0.0, "odom", "base");
+        assert_eq!(
+            validate_frames(&sample, &pointcloud),
+            Err(FrameContractError::CloudFrameMismatch)
+        );
+        assert_eq!(validate_frames(&sample, &cloud(1_000, "")), Ok(()));
+    }
+
+    #[test]
     fn push_pose_evicts_oldest_beyond_capacity() {
-        let mut poses: VecDeque<(f64, Vector3<f32>, UnitQuaternion<f32>)> = VecDeque::new();
+        let mut poses = VecDeque::new();
         for i in 0..(POSE_BUFFER_LEN + 10) {
-            push_pose(
-                &mut poses,
-                (i as f64, Vector3::zeros(), UnitQuaternion::identity()),
-            );
+            push_pose(&mut poses, pose(i as i32, 0.0, "odom", "lidar"));
         }
         assert_eq!(
             poses.len(),
             POSE_BUFFER_LEN,
             "buffer capped at POSE_BUFFER_LEN"
         );
-        assert_eq!(poses.front().unwrap().0, 10.0, "oldest 10 evicted");
-        assert_eq!(poses.back().unwrap().0, (POSE_BUFFER_LEN + 9) as f64);
+        assert_eq!(poses.front().unwrap().stamp, 0.01, "oldest 10 evicted");
+        assert_eq!(
+            poses.back().unwrap().stamp,
+            (POSE_BUFFER_LEN + 9) as f64 / 1_000.0
+        );
+    }
+
+    #[test]
+    fn pose_history_resets_on_frame_epoch() {
+        let mut poses = VecDeque::new();
+        assert!(!push_pose(&mut poses, pose(1_000, 0.0, "odom", "lidar")));
+        assert!(!push_pose(&mut poses, pose(1_050, 0.0, "odom", "lidar")));
+
+        assert!(push_pose(&mut poses, pose(1_060, 0.0, "map", "lidar")));
+        assert_eq!(poses.len(), 1);
+        assert_eq!(poses.front().unwrap().parent_frame, "map");
+
+        assert!(push_pose(&mut poses, pose(1_070, 0.0, "map", "base")));
+        assert_eq!(poses.len(), 1);
+        assert_eq!(poses.front().unwrap().child_frame, "base");
+    }
+
+    #[test]
+    fn map_state_resets_only_on_parent_frame_change() {
+        let mut state = MapState::default();
+        assert!(!state.prepare_for_parent("odom"));
+        state.map.voxels.insert((0, 0, 0), Voxel::with_health(1));
+        state.frame_count = 7;
+        state.batch_points.push((1.0, 2.0, 3.0));
+
+        assert!(!state.prepare_for_parent("odom"));
+        assert!(state.map.voxels.contains_key(&(0, 0, 0)));
+        assert_eq!(state.frame_count, 7);
+
+        assert!(state.prepare_for_parent("map"));
+        assert!(state.map.voxels.is_empty());
+        assert_eq!(state.frame_count, 0);
+        assert!(state.batch_points.is_empty());
+        assert_eq!(state.parent_frame.as_deref(), Some("map"));
     }
 
     fn cloud_points(c: &PointCloud2) -> AHashSet<(u32, u32, u32)> {
@@ -637,6 +789,10 @@ mod tests {
         for n in 1..10 {
             assert!(!emit_due(n, 0));
         }
+
+        assert!(emit_due_or_frame_change(1, 50, true));
+        assert!(!emit_due_or_frame_change(1, 50, false));
+        assert!(!emit_due_or_frame_change(1, 0, true));
     }
 
     #[test]
