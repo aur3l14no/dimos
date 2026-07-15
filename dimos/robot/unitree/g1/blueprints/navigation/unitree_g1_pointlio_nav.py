@@ -30,6 +30,12 @@ from dimos.navigation.movement_manager.movement_manager import MovementManager
 from dimos.navigation.replanning_a_star.module import ReplanningAStarPlanner
 from dimos.robot.unitree.g1.config import G1
 from dimos.robot.unitree.g1.effectors.high_level.dds_sdk import G1HighLevelDdsSdk
+from dimos.robot.unitree.g1.g1_rerun import (
+    g1_pointlio_costmap,
+    g1_pointlio_ground_z,
+    g1_pointlio_pelvis_transform,
+    g1_pointlio_static_body,
+)
 from dimos.visualization.vis_module import vis_module
 
 assert G1.height_clearance is not None and G1.width_clearance is not None
@@ -39,36 +45,26 @@ _OVERHEAD_SAFETY_MARGIN = 0.2
 _MAX_STEP_HEIGHT = 0.10
 _SAFE_RADIUS_MARGIN = 0.6
 _ROTATION_DIAMETER = 0.8
-_GROUND_Z = -G1.internal_odom_offsets["mid360_link"].position.z
 
 
 def _render_global_map(msg: PointCloud2) -> Any:
     return msg.to_rerun(voxel_size=_VOXEL_SIZE)
 
 
+def _render_loaded_map(msg: PointCloud2) -> Any:
+    return msg.to_rerun(voxel_size=_VOXEL_SIZE, colors=[70, 130, 255])
+
+
+def _render_merged_map(msg: PointCloud2) -> Any:
+    return msg.to_rerun(voxel_size=_VOXEL_SIZE, colors=[80, 220, 140])
+
+
 def _render_costmap(msg: OccupancyGrid) -> Any:
-    return msg.to_rerun(
-        colormap="Accent",
-        z_offset=_GROUND_Z + 0.02,
-        opacity=0.2,
-        background="#484981",
-    )
+    return g1_pointlio_costmap(msg)
 
 
 def _render_path(msg: Path) -> Any:
-    return msg.to_rerun(z_offset=_GROUND_Z + 0.3)
-
-
-def _static_g1_body(rr: Any) -> list[Any]:
-    return [
-        rr.Boxes3D(
-            half_sizes=[0.25, 0.20, 0.6],
-            centers=[[0.0, 0.0, -0.6]],
-            colors=[(0, 255, 127)],
-            fill_mode="MajorWireframe",
-        ),
-        rr.Transform3D(parent_frame="tf#/mid360_link"),
-    ]
+    return msg.to_rerun(z_offset=g1_pointlio_ground_z() + 0.3)
 
 
 def _g1_pointlio_rerun_blueprint() -> Any:
@@ -82,7 +78,7 @@ def _g1_pointlio_rerun_blueprint() -> Any:
             name="G1 PointLIO navigation",
             background=rrb.Background(kind="SolidColor", color=[0, 0, 0]),
             line_grid=rrb.LineGrid3D(
-                plane=rr.components.Plane3D.XY.with_distance(_GROUND_Z),
+                plane=rr.components.Plane3D.XY.with_distance(g1_pointlio_ground_z()),
             ),
         ),
         rrb.TimePanel(state="collapsed"),
@@ -93,19 +89,22 @@ _rerun_config = {
     "blueprint": _g1_pointlio_rerun_blueprint,
     "visual_override": {
         "world/global_map": _render_global_map,
+        "world/loaded_map": _render_loaded_map,
+        "world/merged_map": _render_merged_map,
         "world/global_costmap": _render_costmap,
         "world/navigation_costmap": _render_costmap,
         "world/path": _render_path,
         "world/lidar": None,
         "world/deskewed_lidar": None,
         "world/local_map": None,
+        "world/lidar_odometry": g1_pointlio_pelvis_transform,
     },
     "max_hz": {
         "world/path": 0,
     },
     "memory_limit": "64MB",
     "static": {
-        "world/robot_body": _static_g1_body,
+        "world/lidar_odometry/g1": g1_pointlio_static_body,
     },
 }
 

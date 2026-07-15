@@ -20,6 +20,7 @@ from typing import Any
 
 import numpy as np
 
+from dimos.msgs.geometry_msgs.Quaternion import Quaternion
 from dimos.visualization.rerun.urdf_robot import (
     UrdfRobotJointStateRerunFactory,
     UrdfRobotStaticRerunFactory,
@@ -27,6 +28,22 @@ from dimos.visualization.rerun.urdf_robot import (
 
 G1_RERUN_ROOT = "world/odom/g1"
 G1_RERUN_URDF = "g1_urdf/g1.fixed.urdf"
+
+# Rest-pose pelvis -> Mid-360 transform from g1.urdf. Keep this explicit because
+# the URDF visualization dependency (yourdfpy) is unavailable on Linux aarch64.
+_G1_MID360_PITCH = 0.04014257279586953
+_G1_PELVIS_TO_MID360 = np.array(
+    [
+        [np.cos(_G1_MID360_PITCH), 0.0, np.sin(_G1_MID360_PITCH), -0.00368],
+        [0.0, 1.0, 0.0, 0.00003],
+        [-np.sin(_G1_MID360_PITCH), 0.0, np.cos(_G1_MID360_PITCH), 0.46018],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=float,
+)
+_G1_MID360_TO_PELVIS = np.linalg.inv(_G1_PELVIS_TO_MID360)
+_G1_MID360_UPSIDE_DOWN = np.diag([1.0, -1.0, -1.0])
+_G1_NOMINAL_PELVIS_Z = 0.74
 
 # Classic costmap palette, indexed by grid value + 1:
 # transparent unknown, blue free, orange occupied, red lethal.
@@ -71,6 +88,48 @@ def g1_static_robot(rr: Any) -> list[Any]:
         ),
         rr.Transform3D(parent_frame="tf#/sensor"),
     ]
+
+
+def g1_pointlio_static_body(rr: Any) -> list[Any]:
+    """Static G1 wireframe expressed in the pelvis frame.
+
+    The box extends from the nominal ground contact at -0.74m to the Mid-360
+    mount at +0.46m. Its entity path must be a child of the dynamic pelvis
+    transform produced by :func:`g1_pointlio_pelvis_transform`.
+    """
+    return [
+        rr.Boxes3D(
+            half_sizes=[0.25, 0.20, 0.6],
+            centers=[[0, 0, -0.14]],
+            colors=[(0, 255, 127)],
+            fill_mode="MajorWireframe",
+        )
+    ]
+
+
+def g1_pointlio_pelvis_transform(odom: Any) -> Any:
+    """Convert upside-down Mid-360 odometry into the G1 pelvis pose."""
+    import rerun as rr
+
+    world_from_mid360 = np.eye(4)
+    world_from_mid360[:3, :3] = odom.orientation.to_rotation_matrix() @ _G1_MID360_UPSIDE_DOWN
+    world_from_mid360[:3, 3] = (odom.x, odom.y, odom.z)
+    world_from_pelvis = world_from_mid360 @ _G1_MID360_TO_PELVIS
+    orientation = Quaternion.from_rotation_matrix(world_from_pelvis[:3, :3])
+    return rr.Transform3D(
+        translation=world_from_pelvis[:3, 3].tolist(),
+        rotation=rr.Quaternion(xyzw=[orientation.x, orientation.y, orientation.z, orientation.w]),
+    )
+
+
+def g1_pointlio_ground_z() -> float:
+    """Nominal ground height in PointLIO's Mid-360 boot frame."""
+    return -(float(_G1_PELVIS_TO_MID360[2, 3]) + _G1_NOMINAL_PELVIS_Z)
+
+
+def g1_pointlio_costmap(grid: Any) -> Any:
+    """Render a PointLIO costmap on the G1's nominal ground plane."""
+    return g1_costmap(grid, z_offset=g1_pointlio_ground_z() + 0.02)
 
 
 def g1_odometry_tf_override(odom: Any) -> Any:
