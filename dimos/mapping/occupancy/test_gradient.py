@@ -12,17 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Literal
+
 import numpy as np
 import pytest
 
 from dimos.mapping.occupancy.gradient import gradient, voronoi_gradient
 from dimos.mapping.occupancy.visualizations import visualize_occupancy_grid
+from dimos.msgs.nav_msgs.OccupancyGrid import CostValues, OccupancyGrid
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.utils.data import get_data
 
 
 @pytest.mark.parametrize("method", ["simple", "voronoi"])
-def test_gradient(occupancy, method) -> None:
+def test_gradient(occupancy: OccupancyGrid, method: Literal["simple", "voronoi"]) -> None:
     expected = Image.from_file(get_data(f"gradient_{method}.png"))
 
     match method:
@@ -35,3 +38,14 @@ def test_gradient(occupancy, method) -> None:
 
     actual = visualize_occupancy_grid(og, "rainbow")
     np.testing.assert_array_equal(actual.data, expected.data)
+
+
+def test_gradient_without_obstacles_is_free_and_preserves_unknown() -> None:
+    grid = np.zeros((7, 9), dtype=np.int8)
+    grid[2, 3] = CostValues.UNKNOWN
+
+    result = gradient(OccupancyGrid(grid, resolution=0.1), obstacle_threshold=100)
+
+    assert result.grid[2, 3] == CostValues.UNKNOWN
+    known = result.grid != CostValues.UNKNOWN
+    assert np.all(result.grid[known] == CostValues.FREE)

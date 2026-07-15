@@ -56,6 +56,17 @@ def gradient(
     # Unknown cells are not considered obstacles for distance calculation
     obstacle_map = (occupancy_grid.grid >= obstacle_threshold).astype(np.float32)
 
+    if not np.any(obstacle_map):
+        gradient_data = np.zeros_like(occupancy_grid.grid, dtype=np.int8)
+        gradient_data[unknown_mask] = CostValues.UNKNOWN
+        return OccupancyGrid(
+            grid=gradient_data,
+            resolution=occupancy_grid.resolution,
+            origin=occupancy_grid.origin,
+            frame_id=occupancy_grid.frame_id,
+            ts=occupancy_grid.ts,
+        )
+
     # Compute distance transform (distance to nearest obstacle in cells)
     # Unknown cells are treated as if they don't exist for distance calculation
     distance_cells = cast("NDArray[np.float64]", ndimage.distance_transform_edt(1 - obstacle_map))

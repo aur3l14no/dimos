@@ -12,11 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import numpy as np
+
 from dimos.mapping.occupancy.gradient import GradientStrategy, gradient, voronoi_gradient
 from dimos.mapping.occupancy.inflation import simple_inflate
 from dimos.mapping.occupancy.operations import overlay_occupied, smooth_occupied
 from dimos.mapping.occupancy.types import NavigationStrategy
-from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
+from dimos.msgs.nav_msgs.OccupancyGrid import CostValues, OccupancyGrid
+
+
+def _preserve_traversal_costs(
+    clearance_map: OccupancyGrid, terrain_map: OccupancyGrid
+) -> OccupancyGrid:
+    """Keep non-lethal terrain costs alongside obstacle-clearance costs."""
+    known = terrain_map.grid != CostValues.UNKNOWN
+    clearance_map.grid[known] = np.maximum(
+        clearance_map.grid[known],
+        terrain_map.grid[known],
+    )
+    return clearance_map
 
 
 def make_navigation_map(
@@ -37,9 +51,22 @@ def make_navigation_map(
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
 
+    # Occupancy values 1..99 are traversable terrain costs, not obstacle
+    # seeds. Only lethal cells are inflated and converted to hard obstacles;
+    # the graded terrain costs are overlaid onto the clearance field below.
     if gradient_strategy == "gradient":
-        return gradient(costmap, max_distance=gradient_distance)
+        clearance_map = gradient(
+            costmap,
+            obstacle_threshold=CostValues.OCCUPIED,
+            max_distance=gradient_distance,
+        )
     elif gradient_strategy == "voronoi":
-        return voronoi_gradient(costmap, max_distance=gradient_distance)
+        clearance_map = voronoi_gradient(
+            costmap,
+            obstacle_threshold=CostValues.OCCUPIED,
+            max_distance=gradient_distance,
+        )
     else:
         raise ValueError(f"Unknown gradient strategy: {gradient_strategy}")
+
+    return _preserve_traversal_costs(clearance_map, costmap)
