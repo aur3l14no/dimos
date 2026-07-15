@@ -16,13 +16,18 @@
 
 from __future__ import annotations
 
+__all__ = ["VoxelRayMapper", "local_bounds"]
+
 try:
-    from dimos_voxel_ray_tracing import (  # noqa: F401  (re-exported)
+    from dimos_voxel_ray_tracing import (
         VoxelRayMapper,
         local_bounds,
     )
 except ImportError as e:
     raise ImportError(
-        "dimos_voxel_ray_tracing is not built. Run: "
-        "uv run maturin develop --uv -m dimos/mapping/ray_tracing/rust/Cargo.toml"
+        "dimos_voxel_ray_tracing is unavailable. The ray-tracing map tools require "
+        "the Nix-built PyO3 extension from this checkout. Build RayTracingVoxelMap "
+        "with its configured build command, then expose "
+        "dimos/mapping/ray_tracing/rust/result/lib/python3.12/site-packages to the "
+        "Python environment running `dimos map`."
     ) from e

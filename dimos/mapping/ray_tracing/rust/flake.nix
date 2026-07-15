@@ -58,6 +58,10 @@
           version = "0.1.0";
 
           inherit src;
+          # Python extension modules resolve CPython symbols from the loading
+          # interpreter on Darwin instead of linking libpython directly.
+          RUSTFLAGS = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin
+            "-C link-arg=-undefined -C link-arg=dynamic_lookup";
           cargoLock = ./Cargo.lock;
           cargoToml = ./Cargo.toml;
           postUnpack = ''
@@ -74,6 +78,19 @@
           commonArgs
           // {
             inherit cargoArtifacts;
+            cargoExtraArgs = "--locked --lib --bin voxel_ray_tracing";
+
+            postInstall = ''
+              extension="$out/lib/libdimos_voxel_ray_tracing${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}"
+              if [ ! -f "$extension" ]; then
+                echo "missing PyO3 cdylib: $extension" >&2
+                exit 1
+              fi
+
+              mkdir -p "$out/${pkgs.python312.sitePackages}"
+              ln -s "../../$(basename "$extension")" \
+                "$out/${pkgs.python312.sitePackages}/dimos_voxel_ray_tracing.abi3.so"
+            '';
 
             meta.mainProgram = "voxel_ray_tracing";
           }
