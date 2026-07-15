@@ -53,6 +53,10 @@ _dc = 1.42  # Diagonal cost (approximately sqrt(2))
 _movement_costs = [_sc, _sc, _sc, _sc, _dc, _dc, _dc, _dc]
 
 
+def _is_blocked(value: int, cost_threshold: int, unknown_penalty: float) -> bool:
+    return value >= cost_threshold or (value == CostValues.UNKNOWN and unknown_penalty >= 1.0)
+
+
 # Heuristic function (Octile distance for 8-connected grid)
 def _heuristic(x1: int, y1: int, x2: int, y2: int) -> float:
     dx = abs(x2 - x1)
@@ -140,6 +144,8 @@ def min_cost_astar(
     start_tuple = (int(start_vector.x), int(start_vector.y))
     goal_tuple = (int(goal_vector.x), int(goal_vector.y))
 
+    if not (0 <= start_tuple[0] < costmap.width and 0 <= start_tuple[1] < costmap.height):
+        return None
     if not (0 <= goal_tuple[0] < costmap.width and 0 <= goal_tuple[1] < costmap.height):
         return None
 
@@ -201,13 +207,19 @@ def min_cost_astar(
 
             neighbor_val = costmap.grid[neighbor_y, neighbor_x]
 
-            if neighbor_val >= cost_threshold:
+            if _is_blocked(int(neighbor_val), cost_threshold, unknown_penalty):
                 continue
+
+            if dx != 0 and dy != 0:
+                side_x = int(costmap.grid[current_y, current_x + dx])
+                side_y = int(costmap.grid[current_y + dy, current_x])
+                if _is_blocked(side_x, cost_threshold, unknown_penalty) or _is_blocked(
+                    side_y, cost_threshold, unknown_penalty
+                ):
+                    continue
 
             if neighbor_val == CostValues.UNKNOWN:
                 cell_cost = cost_threshold * unknown_penalty
-                if cell_cost >= cost_threshold:
-                    continue
             elif neighbor_val == CostValues.FREE:
                 cell_cost = 0.0
             else:

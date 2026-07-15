@@ -134,3 +134,34 @@ def test_astar_python_and_cpp(costmap) -> None:
         [(p.position.x, p.position.y) for p in path_cpp.poses],
         atol=0.05001,
     )
+
+
+@pytest.mark.parametrize("use_cpp", [False, True])
+def test_astar_does_not_cut_a_blocked_diagonal_corner(use_cpp: bool) -> None:
+    grid = np.zeros((3, 3), dtype=np.int8)
+    grid[0, 1] = 100
+    grid[1, 0] = 100
+    costmap = OccupancyGrid(grid, resolution=1.0)
+
+    path = min_cost_astar(
+        costmap,
+        costmap.grid_to_world((1, 1)),
+        costmap.grid_to_world((0, 0)),
+        use_cpp=use_cpp,
+    )
+
+    assert path is None
+
+
+@pytest.mark.parametrize("use_cpp", [False, True])
+def test_astar_rejects_start_outside_costmap(use_cpp: bool) -> None:
+    costmap = OccupancyGrid(np.zeros((3, 3), dtype=np.int8), resolution=1.0)
+
+    path = min_cost_astar(
+        costmap,
+        costmap.grid_to_world((1, 1)),
+        (-1.0, -1.0),
+        use_cpp=use_cpp,
+    )
+
+    assert path is None

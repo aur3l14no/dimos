@@ -42,6 +42,11 @@ constexpr double MOVE_COSTS[8] = {
 constexpr int8_t COST_UNKNOWN = -1;
 constexpr int8_t COST_FREE = 0;
 
+inline bool is_blocked(int8_t value, int cost_threshold, double unknown_penalty) {
+    return value >= cost_threshold ||
+           (value == COST_UNKNOWN && unknown_penalty >= 1.0);
+}
+
 // Pack coordinates into a single 64-bit key for fast hashing
 inline uint64_t pack_coords(int x, int y) {
     return (static_cast<uint64_t>(static_cast<uint32_t>(x)) << 32) |
@@ -195,16 +200,22 @@ std::vector<std::pair<int, int>> min_cost_astar_cpp(
             // Get cell value (note: grid is [y, x] in row-major order)
             const int8_t val = buf(ny, nx);
 
-            if (val >= cost_threshold) {
+            if (is_blocked(val, cost_threshold, unknown_penalty)) {
                 continue;
+            }
+
+            if (DX[i] != 0 && DY[i] != 0) {
+                const int8_t side_x = buf(cy, cx + DX[i]);
+                const int8_t side_y = buf(cy + DY[i], cx);
+                if (is_blocked(side_x, cost_threshold, unknown_penalty) ||
+                    is_blocked(side_y, cost_threshold, unknown_penalty)) {
+                    continue;
+                }
             }
 
             double cell_cost;
             if (val == COST_UNKNOWN) {
                 cell_cost = cost_threshold * unknown_penalty;
-                if (cell_cost >= cost_threshold) {
-                    continue;
-                }
             } else if (val == COST_FREE) {
                 cell_cost = 0.0;
             } else {
