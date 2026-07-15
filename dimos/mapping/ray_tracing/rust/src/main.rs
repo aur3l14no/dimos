@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dimos_module::{error_throttled, run_with_transport, warn_throttled, Input, Module, Output};
@@ -24,8 +25,81 @@ use lcm_msgs::nav_msgs::Odometry;
 use lcm_msgs::sensor_msgs::{PointCloud2, PointField};
 use lcm_msgs::std_msgs::{Header, Time};
 use nalgebra::{UnitQuaternion, Vector3};
+use tokio::sync::Notify;
+
+struct MapJob {
+    cloud: PointCloud2,
+    translation: Vector3<f32>,
+    rotation: UnitQuaternion<f32>,
+}
+
+struct LatestState<T> {
+    pending: Option<T>,
+    replaced: u64,
+}
+
+impl<T> Default for LatestState<T> {
+    fn default() -> Self {
+        Self {
+            pending: None,
+            replaced: 0,
+        }
+    }
+}
+
+/// A single-consumer slot that retains only the newest pending value.
+struct LatestSlot<T> {
+    state: Mutex<LatestState<T>>,
+    wake: Notify,
+}
+
+impl<T> Default for LatestSlot<T> {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(LatestState::default()),
+            wake: Notify::new(),
+        }
+    }
+}
+
+impl<T> LatestSlot<T> {
+    /// Replace the pending value, returning the cumulative replacement count
+    /// when an older value was displaced.
+    fn replace(&self, value: T) -> Option<u64> {
+        let replaced = {
+            let mut state = self.state.lock().expect("latest slot mutex");
+            if state.pending.replace(value).is_some() {
+                state.replaced += 1;
+                Some(state.replaced)
+            } else {
+                None
+            }
+        };
+        self.wake.notify_one();
+        replaced
+    }
+
+    fn take(&self) -> Option<T> {
+        self.state.lock().expect("latest slot mutex").pending.take()
+    }
+
+    async fn next(&self) -> T {
+        loop {
+            if let Some(value) = self.take() {
+                return value;
+            }
+            self.wake.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn replaced_count(&self) -> u64 {
+        self.state.lock().expect("latest slot mutex").replaced
+    }
+}
 
 #[derive(Module)]
+#[module(setup = spawn_worker, teardown = stop_worker)]
 struct RayTracingVoxelMap {
     #[input(decode = PointCloud2::decode, handler = on_lidar)]
     lidar: Input<PointCloud2>,
@@ -47,15 +121,44 @@ struct RayTracingVoxelMap {
     #[config]
     config: Config,
 
-    map: VoxelMap,
     poses: VecDeque<(f64, Vector3<f32>, UnitQuaternion<f32>)>,
-    frame_count: u32,
-    batch_points: Vec<(f32, f32, f32)>,
-    batch_origins: Vec<(f32, f32, f32)>,
+    latest_job: Arc<LatestSlot<MapJob>>,
+    worker: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RayTracingVoxelMap {
+    async fn spawn_worker(&mut self) {
+        let worker = MapWorker {
+            latest_job: Arc::clone(&self.latest_job),
+            config: self.config.clone(),
+            global_map: self.global_map.clone(),
+            local_map: self.local_map.clone(),
+            region_bounds: self.region_bounds.clone(),
+        };
+        self.worker = Some(tokio::spawn(worker.run()));
+    }
+
+    async fn stop_worker(&mut self) {
+        if let Some(handle) = self.worker.take() {
+            handle.abort();
+            handle_worker_exit(handle.await, true);
+        }
+    }
+
+    async fn ensure_worker_running(&mut self) {
+        let Some(handle) = self.worker.as_ref() else {
+            panic!("map worker is not running");
+        };
+        if !handle.is_finished() {
+            return;
+        }
+
+        let handle = self.worker.take().expect("worker checked above");
+        handle_worker_exit(handle.await, false);
+    }
+
     async fn on_odometry(&mut self, msg: Odometry) {
+        self.ensure_worker_running().await;
         let p = &msg.pose.pose.position;
         let q = &msg.pose.pose.orientation;
         push_pose(
@@ -71,6 +174,7 @@ impl RayTracingVoxelMap {
     }
 
     async fn on_lidar(&mut self, msg: PointCloud2) {
+        self.ensure_worker_running().await;
         // Register with the pose nearest the cloud stamp, never a stale one.
         let Some((translation, rotation)) = nearest_pose(&self.poses, time_secs(&msg.header.stamp))
         else {
@@ -80,23 +184,104 @@ impl RayTracingVoxelMap {
             );
             return;
         };
-        let origin = (translation.x, translation.y, translation.z);
+        if let Some(replaced_total) = self.latest_job.replace(MapJob {
+            cloud: msg,
+            translation,
+            rotation,
+        }) {
+            warn_throttled!(
+                Duration::from_secs(1),
+                replaced_total,
+                "Ray tracing is busy; replaced the pending cloud with a newer one.",
+            );
+        }
+    }
+}
 
+fn handle_worker_exit(result: Result<(), tokio::task::JoinError>, cancellation_expected: bool) {
+    match result {
+        Err(error) if cancellation_expected && error.is_cancelled() => {}
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => panic!("map worker stopped unexpectedly: {error}"),
+        Ok(()) => panic!("map worker exited unexpectedly"),
+    }
+}
+
+#[derive(Default)]
+struct MapState {
+    map: VoxelMap,
+    frame_count: u32,
+    batch_points: Vec<(f32, f32, f32)>,
+    batch_origins: Vec<(f32, f32, f32)>,
+}
+
+struct MapOutputs {
+    bounds: Option<PoseStamped>,
+    global: Option<PointCloud2>,
+    local: Option<PointCloud2>,
+}
+
+struct MapWorker {
+    latest_job: Arc<LatestSlot<MapJob>>,
+    config: Config,
+    global_map: Output<PointCloud2>,
+    local_map: Output<PointCloud2>,
+    region_bounds: Output<PoseStamped>,
+}
+
+impl MapWorker {
+    async fn run(self) {
+        let mut state = MapState::default();
+        loop {
+            let job = self.latest_job.next().await;
+            self.process(&mut state, job).await;
+        }
+    }
+
+    async fn process(&self, state: &mut MapState, job: MapJob) {
+        let Some(outputs) = tokio::task::block_in_place(|| self.update(state, job)) else {
+            return;
+        };
+
+        if let Some(bounds) = outputs.bounds {
+            if let Err(error) = self.region_bounds.publish(&bounds).await {
+                error_throttled!(
+                    Duration::from_secs(1),
+                    error = %error,
+                    "Region bounds failed to publish",
+                );
+            }
+        }
+        if let Some(global) = outputs.global {
+            publish_cloud(&self.global_map, &global).await;
+        }
+        if let Some(local) = outputs.local {
+            publish_cloud(&self.local_map, &local).await;
+        }
+    }
+
+    fn update(&self, state: &mut MapState, job: MapJob) -> Option<MapOutputs> {
+        let MapJob {
+            cloud,
+            translation,
+            rotation,
+        } = job;
+        let origin = (translation.x, translation.y, translation.z);
         let voxel_size = self.config.voxel_size;
 
-        let points = match extract_xyz(&msg) {
-            Ok(p) => p,
-            Err(e) => {
+        let points = match extract_xyz(&cloud) {
+            Ok(points) => points,
+            Err(error) => {
                 warn_throttled!(
                     Duration::from_secs(1),
-                    error = %e,
+                    error = %error,
                     "Failed to get lidar points, dropped a cloud.",
                 );
-                return;
+                return None;
             }
         };
         if points.is_empty() {
-            return;
+            return None;
         }
 
         // Transform sensor-frame points into the world by the odom pose.
@@ -104,40 +289,38 @@ impl RayTracingVoxelMap {
         let points: Vec<(f32, f32, f32)> = points
             .iter()
             .map(|&(x, y, z)| {
-                let p = rot * Vector3::new(x, y, z) + translation;
-                (p.x, p.y, p.z)
+                let point = rot * Vector3::new(x, y, z) + translation;
+                (point.x, point.y, point.z)
             })
             .collect();
 
         let out_frame_id = "world";
-
-        let live = update_map(&mut self.map, origin, &points, &self.config);
+        let live = update_map(&mut state.map, origin, &points, &self.config);
 
         // The batch only feeds the local region bounds, so skip it when the local
         // map is disabled.
         if self.config.emit_every > 0 {
-            self.batch_points.extend_from_slice(&points);
-            self.batch_origins.push(origin);
+            state.batch_points.extend_from_slice(&points);
+            state.batch_origins.push(origin);
         }
 
-        self.frame_count += 1;
-        let local_due = emit_due(self.frame_count, self.config.emit_every);
-
-        let cylinder = if local_due {
+        state.frame_count += 1;
+        let local_due = emit_due(state.frame_count, self.config.emit_every);
+        let (bounds, cylinder) = if local_due {
             let margin = self.config.shadow_depth + voxel_size;
             let (cx, cy, radius, z_min, z_max) = batch_local_bounds(
-                &self.batch_points,
-                &self.batch_origins,
+                &state.batch_points,
+                &state.batch_origins,
                 self.config.region_percentile,
                 margin,
             );
-            self.batch_points.clear();
-            self.batch_origins.clear();
+            state.batch_points.clear();
+            state.batch_origins.clear();
 
             let bounds_msg = PoseStamped {
                 header: Header {
                     seq: 0,
-                    stamp: msg.header.stamp.clone(),
+                    stamp: cloud.header.stamp.clone(),
                     frame_id: out_frame_id.to_string(),
                 },
                 pose: Pose {
@@ -154,38 +337,41 @@ impl RayTracingVoxelMap {
                     },
                 },
             };
-            if let Err(e) = self.region_bounds.publish(&bounds_msg).await {
-                error_throttled!(
-                    Duration::from_secs(1),
-                    error = %e,
-                    "Region bounds failed to publish",
-                );
-            }
-            Some(LocalBounds {
-                origin_x: cx,
-                origin_y: cy,
-                r_xy_max_sq: radius * radius,
-                z_min,
-                z_max,
-            })
+            (
+                Some(bounds_msg),
+                Some(LocalBounds {
+                    origin_x: cx,
+                    origin_y: cy,
+                    r_xy_max_sq: radius * radius,
+                    z_min,
+                    z_max,
+                }),
+            )
         } else {
-            None
+            (None, None)
         };
 
-        let global_due = emit_due(self.frame_count, self.config.global_emit_every);
+        let stamp = cloud.header.stamp;
+        let global = emit_due(state.frame_count, self.config.global_emit_every).then(|| {
+            let points = emit_points(&state.map, voxel_size, None, 0, &live);
+            points_to_cloud(&points, out_frame_id, stamp.clone())
+        });
+        let local = cylinder.as_ref().map(|bounds| {
+            let points = emit_points(
+                &state.map,
+                voxel_size,
+                Some(bounds),
+                self.config.support_min,
+                &live,
+            );
+            points_to_cloud(&points, out_frame_id, stamp)
+        });
 
-        let stamp = msg.header.stamp;
-        let support_min = self.config.support_min;
-        if global_due {
-            let points = emit_points(&self.map, voxel_size, None, 0, &live);
-            let global = points_to_cloud(&points, out_frame_id, stamp.clone());
-            publish_cloud(&self.global_map, &global).await;
-        }
-        if let Some(cyl) = &cylinder {
-            let points = emit_points(&self.map, voxel_size, Some(cyl), support_min, &live);
-            let local = points_to_cloud(&points, out_frame_id, stamp);
-            publish_cloud(&self.local_map, &local).await;
-        }
+        Some(MapOutputs {
+            bounds,
+            global,
+            local,
+        })
     }
 }
 
@@ -370,6 +556,21 @@ mod tests {
     use super::*;
     use ahash::AHashSet;
     use dimos_voxel_ray_tracing::voxel_ray_tracer::{Voxel, VoxelKey};
+
+    #[test]
+    fn latest_slot_keeps_newest_value_and_counts_replacements() {
+        let slot = LatestSlot::default();
+
+        assert_eq!(slot.replace(1), None);
+        assert_eq!(slot.replace(2), Some(1));
+        assert_eq!(slot.replace(3), Some(2));
+        assert_eq!(slot.replaced_count(), 2);
+        assert_eq!(slot.take(), Some(3));
+
+        assert_eq!(slot.replace(4), None);
+        assert_eq!(slot.replaced_count(), 2);
+        assert_eq!(slot.take(), Some(4));
+    }
 
     #[test]
     fn nearest_pose_picks_by_stamp_and_gates_on_tolerance() {
