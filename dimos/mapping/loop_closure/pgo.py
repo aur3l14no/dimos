@@ -272,9 +272,13 @@ class PGO(Transformer[PointCloud2, "PoseGraph"]):
             pose = obs.pose
             if pose is None:
                 continue
-            # Placeholder filter: zero translation OR uninitialized (all-zero)
-            # quaternion. Identity rotation (qw=1) is valid and stays.
-            if pose.position.is_zero() or pose.orientation.is_zero():
+            translation = pose.position.to_numpy()
+            quaternion = pose.orientation.to_numpy()
+            if (
+                not np.isfinite(translation).all()
+                or not np.isfinite(quaternion).all()
+                or float(quaternion @ quaternion) < 1e-12
+            ):
                 continue
             pgo.process(_obs_to_pose3(obs), obs.ts, obs.data)
 
