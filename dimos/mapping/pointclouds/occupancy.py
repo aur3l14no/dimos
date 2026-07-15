@@ -265,10 +265,16 @@ def height_cost_occupancy(cloud: PointCloud2, **kwargs: Any) -> OccupancyGrid:
         cost_float = (height_change_per_cell / cfg.can_climb) * 100.0
         cost_float = np.clip(cost_float, 0, 100)
 
-        # Erode observed mask - only trust gradients where all neighbors are observed
-        # This prevents false high costs at boundaries with unknown regions
-        structure = ndimage.generate_binary_structure(2, 1)  # 4-connectivity
-        valid_gradient_mask = ndimage.binary_erosion(observed_mask, structure=structure)
+        # Sobel samples the full 3x3 neighborhood, including the diagonals. Only
+        # trust a gradient when that entire footprint is observed; otherwise the
+        # temporary NaN -> 0 fill above would turn the edge of an unobserved hole
+        # into a fictitious height discontinuity.
+        sobel_footprint = np.ones((3, 3), dtype=bool)
+        valid_gradient_mask = ndimage.binary_erosion(
+            observed_mask,
+            structure=sobel_footprint,
+            border_value=0,
+        )
 
         # Convert to int8, marking cells without valid gradients as -1
         cost = np.where(valid_gradient_mask, cost_float.astype(np.int8), -1)
