@@ -38,6 +38,28 @@ RERANK_DIST = FINE_VOXEL * 1.5  # inlier dist for fine-scale candidate scoring
 GRAVITY_TILT_MAX_DEG = 10.0  # reject candidates whose z-axis tilts more than this
 
 
+def project_to_4dof(T: np.ndarray) -> np.ndarray:
+    """Keep translation and yaw while removing roll and pitch from a transform.
+
+    This MVP projects candidates and final Open3D ICP results; the ICP itself
+    remains 6DoF. Replace it with a constrained optimizer if tilted-session
+    accuracy becomes a requirement.
+    """
+    yaw = float(np.arctan2(T[1, 0], T[0, 0]))
+    c = np.cos(yaw)
+    s = np.sin(yaw)
+    projected = np.eye(4)
+    projected[:3, :3] = np.array(
+        [
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    projected[:3, 3] = T[:3, 3]
+    return projected
+
+
 def _preprocess(
     pcd: o3d.geometry.PointCloud, voxel_size: float
 ) -> tuple[o3d.geometry.PointCloud, Any]:
@@ -123,6 +145,8 @@ def _gravity_tilt_deg(T: np.ndarray) -> float:
 def relocalize(
     global_map: o3d.geometry.PointCloud,
     local_map: o3d.geometry.PointCloud,
+    *,
+    gravity_aligned_4dof: bool = False,
 ) -> tuple[np.ndarray, float]:
     """Estimate the 4x4 transform placing ``local_map`` into ``global_map``.
 
@@ -166,6 +190,11 @@ def relocalize(
     # Gravity filter; fall back to all if everything is tilted (degenerate clouds).
     upright = [T for T in candidates if _gravity_tilt_deg(T) <= GRAVITY_TILT_MAX_DEG]
     pool = upright if upright else candidates
+    if gravity_aligned_4dof:
+        # Both sessions are gravity-aligned by their IMUs. Keep the RANSAC
+        # tilt filter for rejecting degenerate candidates, then constrain
+        # every candidate used downstream to x/y/z/yaw.
+        pool = [project_to_4dof(T) for T in pool]
 
     # Build WALL-ONLY clouds for scoring + polish. Floor/ceiling points have
     # vertical normals; they fit equally well in any yaw rotation (flat planes
@@ -207,7 +236,12 @@ def relocalize(
             tukey,
             _reg.ICPConvergenceCriteria(max_iteration=70),
         )
-        polished.append((float(r.fitness), np.asarray(r.transformation)))
+        T_polished = np.asarray(r.transformation)
+        if gravity_aligned_4dof:
+            T_polished = project_to_4dof(T_polished)
+            polished.append((fine_fitness(T_polished), T_polished))
+        else:
+            polished.append((float(r.fitness), T_polished))
     best_fit, best_T = max(polished, key=lambda fT: fT[0])
 
     # Stage 3: final ICP on full clouds, incl. floor/ceiling
@@ -219,4 +253,8 @@ def relocalize(
         tukey,
         _reg.ICPConvergenceCriteria(max_iteration=50),
     )
-    return np.asarray(final.transformation), best_fit
+    final_T = np.asarray(final.transformation)
+    if gravity_aligned_4dof:
+        final_T = project_to_4dof(final_T)
+        return final_T, fine_fitness(final_T)
+    return final_T, best_fit
