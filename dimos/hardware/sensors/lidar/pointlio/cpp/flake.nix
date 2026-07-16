@@ -14,8 +14,8 @@
     };
     fast-lio = {
       # Point-LIO fork (split out of dimos-module-fastlio2's pointlio branch).
-      # Repo is org-internal for now, hence git+ssh instead of github:.
-      url = "git+ssh://git@github.com/dimensionalOS/dimos-module-pointlio?ref=main";
+      # Temporary product pin until the coherent snapshot API lands upstream.
+      url = "github:aur3l14no/dimos-module-pointlio/fix/coherent-deskewed-snapshot";
       flake = false;
     };
     lcm-extended = {
