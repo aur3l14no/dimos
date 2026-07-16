@@ -97,6 +97,7 @@ impl VoxelRayMapper {
         support_min: i32,
     ) -> PyResult<Self> {
         let config = Config {
+            require_exact_pose_match: false,
             voxel_size,
             max_range,
             ray_subsample,
