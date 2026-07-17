@@ -61,6 +61,13 @@ class RayTracingVoxelMapConfig(NativeModuleConfig):
     # frames since their last hit. Zero preserves the full accumulated history.
     # Current-frame hits and the global map are never filtered by this setting.
     local_max_age_frames: int = 0
+    # Near hits enter the local navigation map immediately. Farther hits need a
+    # neighboring hit in the previous scan or enough neighbors in this scan.
+    local_immediate_range: float = 0.0
+    # Local navigation horizon. Zero disables both the cap and evidence gate.
+    # This deliberately does not limit ray clearing or the global/relocalization
+    # map, where distant geometry remains valuable.
+    local_navigation_max_range: float = 0.0
     # Publish the accumulated local map and region bounds every Nth frame. Zero disables them.
     emit_every: int = 1
     # Publish the global map every Nth frame. Zero disables it.

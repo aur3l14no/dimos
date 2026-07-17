@@ -21,7 +21,8 @@ use std::time::Duration;
 use cloud_pose_matcher::{CloudPoseMatcher, MatchOutcome};
 use dimos_module::{error_throttled, run_with_transport, warn_throttled, Input, Module, Output};
 use dimos_voxel_ray_tracing::voxel_ray_tracer::{
-    batch_local_bounds, emit_points, update_map, Config, LocalBounds, VoxelMap,
+    batch_local_bounds, emit_points, filter_navigation_live_voxels, update_map, Config,
+    LocalBounds, VoxelKey, VoxelMap,
 };
 use lcm_msgs::geometry_msgs::{Point, Pose, PoseStamped, Quaternion};
 use lcm_msgs::nav_msgs::Odometry;
@@ -239,6 +240,7 @@ fn handle_worker_exit(result: Result<(), tokio::task::JoinError>, cancellation_e
 #[derive(Default)]
 struct MapState {
     map: VoxelMap,
+    previous_live_voxels: ahash::AHashSet<VoxelKey>,
     frame_count: u32,
     batch_points: Vec<(f32, f32, f32)>,
     batch_origins: Vec<(f32, f32, f32)>,
@@ -354,6 +356,15 @@ impl MapWorker {
         let out_frame_id = parent_frame.as_str();
         let live = update_map(&mut state.map, origin, &points, &self.config);
 
+        // Keep raw hits for the global/relocalization map. Only navigation needs
+        // the extra evidence gate, because its loaded global map already supplies
+        // distant structure and should not turn one far return into an obstacle.
+        // Update this on every processed scan, not only publication frames, so a
+        // "consecutive" hit means the previous observation rather than the last
+        // time the output happened to be published.
+        let previous_live = (self.config.emit_every > 0)
+            .then(|| std::mem::replace(&mut state.previous_live_voxels, live.clone()));
+
         // The batch only feeds the local region bounds, so skip it when the local
         // map is disabled.
         if self.config.emit_every > 0 {
@@ -366,12 +377,18 @@ impl MapWorker {
             emit_due_or_frame_change(state.frame_count, self.config.emit_every, parent_changed);
         let (bounds, cylinder) = if local_due {
             let margin = self.config.shadow_depth + voxel_size;
-            let (cx, cy, radius, z_min, z_max) = batch_local_bounds(
+            let (cx, cy, mut radius, z_min, z_max) = batch_local_bounds(
                 &state.batch_points,
                 &state.batch_origins,
                 self.config.region_percentile,
                 margin,
             );
+            if self.config.local_navigation_max_range > 0.0 {
+                // Recent healthy voxels are emitted separately from current hits,
+                // so cap the local cylinder too; otherwise accumulated points
+                // could bypass the navigation horizon applied below.
+                radius = radius.min(self.config.local_navigation_max_range);
+            }
             state.batch_points.clear();
             state.batch_origins.clear();
 
@@ -421,12 +438,23 @@ impl MapWorker {
             points_to_cloud(&points, out_frame_id, stamp.clone())
         });
         let local = cylinder.as_ref().map(|bounds| {
+            let local_live = filter_navigation_live_voxels(
+                &live,
+                previous_live
+                    .as_ref()
+                    .expect("local output requires previous-live tracking"),
+                origin,
+                voxel_size,
+                self.config.local_immediate_range,
+                self.config.local_navigation_max_range,
+                self.config.support_min,
+            );
             let points = emit_points(
                 &state.map,
                 voxel_size,
                 Some(bounds),
                 self.config.support_min,
-                &live,
+                &local_live,
                 self.config.local_max_age_frames,
             );
             points_to_cloud(&points, out_frame_id, stamp)
@@ -610,6 +638,7 @@ mod tests {
         let mut state = MapState::default();
         assert!(!state.prepare_for_parent("odom"));
         state.map.voxels.insert((0, 0, 0), Voxel::with_health(1));
+        state.previous_live_voxels.insert((1, 0, 0));
         state.frame_count = 7;
         state.batch_points.push((1.0, 2.0, 3.0));
 
@@ -619,6 +648,7 @@ mod tests {
 
         assert!(state.prepare_for_parent("map"));
         assert!(state.map.voxels.is_empty());
+        assert!(state.previous_live_voxels.is_empty());
         assert_eq!(state.frame_count, 0);
         assert!(state.batch_points.is_empty());
         assert_eq!(state.parent_frame.as_deref(), Some("map"));

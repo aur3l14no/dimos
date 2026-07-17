@@ -24,7 +24,7 @@ pub type VoxelHealth = i32;
 
 #[native_config]
 #[derive(Clone)]
-#[validate(schema(function = "validate_health_range"))]
+#[validate(schema(function = "validate_config"))]
 pub struct Config {
     /// Require a pose with exactly the cloud stamp instead of falling back to
     /// the nearest pose after the odometry watermark passes it.
@@ -54,6 +54,15 @@ pub struct Config {
     /// map. Zero keeps the full accumulated history. Current-frame hits and the
     /// global map are unfiltered.
     pub local_max_age_frames: u32,
+    /// Current hits at or below this sensor range enter the local navigation map
+    /// immediately. Beyond it they need temporal or spatial evidence.
+    #[validate(range(min = 0.0))]
+    pub local_immediate_range: f32,
+    /// Maximum range of the local navigation map. Zero disables both this range
+    /// cap and its evidence gate; global accumulation and ray clearing are never
+    /// limited by this setting.
+    #[validate(range(min = 0.0))]
+    pub local_navigation_max_range: f32,
     /// Publish the accumulated local map and region bounds every Nth frame. Zero disables them.
     #[validate(range(min = 0))]
     pub emit_every: u32,
@@ -66,9 +75,16 @@ pub struct Config {
     pub region_percentile: f32,
 }
 
-fn validate_health_range(cfg: &Config) -> Result<(), ValidationError> {
+fn validate_config(cfg: &Config) -> Result<(), ValidationError> {
     if cfg.min_health >= cfg.max_health {
         return Err(ValidationError::new("min_health_lt_max_health"));
+    }
+    if cfg.local_navigation_max_range > 0.0
+        && cfg.local_immediate_range > cfg.local_navigation_max_range
+    {
+        return Err(ValidationError::new(
+            "local_immediate_range_lte_navigation_max_range",
+        ));
     }
     Ok(())
 }
@@ -437,6 +453,107 @@ fn has_support(voxels: &AHashMap<VoxelKey, Voxel>, key: VoxelKey, support_min: i
     false
 }
 
+const LOCAL_TEMPORAL_MATCH_RADIUS_VOXELS: i32 = 2;
+
+fn has_previous_live_neighbor(previous: &AHashSet<VoxelKey>, key: VoxelKey) -> bool {
+    let r = LOCAL_TEMPORAL_MATCH_RADIUS_VOXELS;
+    for dx in -r..=r {
+        for dy in -r..=r {
+            for dz in -r..=r {
+                if dx * dx + dy * dy + dz * dz > r * r {
+                    continue;
+                }
+                if previous.contains(&(key.0 + dx, key.1 + dy, key.2 + dz)) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn live_support_fraction(live: &AHashSet<VoxelKey>, key: VoxelKey, support_min: i32) -> f32 {
+    if support_min <= 0 {
+        return 0.0;
+    }
+
+    let mut count = 0;
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            for dz in -1..=1 {
+                if (dx, dy, dz) == (0, 0, 0) {
+                    continue;
+                }
+                if live.contains(&(key.0 + dx, key.1 + dy, key.2 + dz)) {
+                    count += 1;
+                    if count >= support_min {
+                        return 1.0;
+                    }
+                }
+            }
+        }
+    }
+    count as f32 / support_min as f32
+}
+
+/// Select current hits that are trustworthy enough to affect navigation now.
+///
+/// This is deliberately separate from `max_range`: distant geometry remains
+/// useful to the accumulated global/relocalization map and its rays still need
+/// to clear old voxels. Only the short-lived local navigation output is gated.
+pub fn filter_navigation_live_voxels(
+    live: &AHashSet<VoxelKey>,
+    previous_live: &AHashSet<VoxelKey>,
+    origin: (f32, f32, f32),
+    voxel_size: f32,
+    immediate_range: f32,
+    navigation_max_range: f32,
+    support_min: i32,
+) -> AHashSet<VoxelKey> {
+    if navigation_max_range <= 0.0 {
+        return live.clone();
+    }
+
+    let half = voxel_size * 0.5;
+    let max_range_sq = navigation_max_range * navigation_max_range;
+    let immediate_range = immediate_range.min(navigation_max_range);
+    let immediate_range_sq = immediate_range * immediate_range;
+    let transition_width = navigation_max_range - immediate_range;
+
+    live.iter()
+        .copied()
+        .filter(|&(kx, ky, kz)| {
+            let x = kx as f32 * voxel_size + half;
+            let y = ky as f32 * voxel_size + half;
+            let z = kz as f32 * voxel_size + half;
+            let dx = x - origin.0;
+            let dy = y - origin.1;
+            let dz = z - origin.2;
+            let range_sq = dx * dx + dy * dy + dz * dz;
+            if range_sq > max_range_sq {
+                return false;
+            }
+            if range_sq <= immediate_range_sq || transition_width <= f32::EPSILON {
+                return true;
+            }
+
+            let u = ((range_sq.sqrt() - immediate_range) / transition_width).clamp(0.0, 1.0);
+            // Smoothstep raises the evidence requirement without inventing a
+            // brittle distance at which the same return suddenly changes class.
+            let required_evidence = u * u * (3.0 - 2.0 * u);
+
+            // Do not demand the exact same voxel on consecutive scans: voxel
+            // quantization, robot motion, and angular error move real distant
+            // surfaces across 1-2 voxels. A dense new surface is independently
+            // useful, so temporal OR spatial evidence is enough; requiring both
+            // would reject stable sparse objects and newly appeared obstacles.
+            let spatial_evidence = live_support_fraction(live, (kx, ky, kz), support_min);
+            spatial_evidence + f32::EPSILON >= required_evidence
+                || has_previous_live_neighbor(previous_live, (kx, ky, kz))
+        })
+        .collect()
+}
+
 /// Points for an emitted cloud: sufficiently recent healthy surface voxels
 /// within `bounds` (all when `None`) with at least `support_min` occupied
 /// neighbors, plus this frame's not-yet-healthy `live` voxels within `bounds`.
@@ -752,6 +869,8 @@ mod tests {
             graze_cos: 0.5,
             support_min: 0,
             local_max_age_frames: 0,
+            local_immediate_range: 0.0,
+            local_navigation_max_range: 0.0,
             emit_every: 1,
             global_emit_every: 1,
             region_percentile: 95.0,
@@ -961,6 +1080,8 @@ mod tests {
             graze_cos: 0.5,
             support_min: 0,
             local_max_age_frames: 0,
+            local_immediate_range: 0.0,
+            local_navigation_max_range: 0.0,
             emit_every: 1,
             global_emit_every: 1,
             region_percentile: 95.0,
@@ -1118,6 +1239,8 @@ mod tests {
             graze_cos: 0.5,
             support_min: 0,
             local_max_age_frames: 0,
+            local_immediate_range: 0.0,
+            local_navigation_max_range: 0.0,
             emit_every: 1,
             global_emit_every: 1,
             region_percentile: 95.0,
@@ -1194,6 +1317,8 @@ mod tests {
             graze_cos: 0.5,
             support_min: 0,
             local_max_age_frames: 0,
+            local_immediate_range: 0.0,
+            local_navigation_max_range: 0.0,
             emit_every: 1,
             global_emit_every: 1,
             region_percentile: 95.0,
@@ -1258,6 +1383,8 @@ mod tests {
             graze_cos,
             support_min: 0,
             local_max_age_frames: 0,
+            local_immediate_range: 0.0,
+            local_navigation_max_range: 0.0,
             emit_every: 1,
             global_emit_every: 1,
             region_percentile: 95.0,
@@ -1391,6 +1518,8 @@ mod tests {
             graze_cos: 0.5,
             support_min: 0,
             local_max_age_frames: 0,
+            local_immediate_range: 0.0,
+            local_navigation_max_range: 0.0,
             emit_every: 1,
             global_emit_every: 1,
             region_percentile: 95.0,
@@ -1443,6 +1572,77 @@ mod tests {
             !gated.contains(&isolated),
             "isolated voxel must be gated out"
         );
+    }
+
+    #[test]
+    fn navigation_live_gate_keeps_near_hits_and_caps_far_hits() {
+        let origin = (0.5, 0.5, 0.5);
+        let live: AHashSet<VoxelKey> = [(5, 0, 0), (7, 0, 0), (11, 0, 0)].into_iter().collect();
+        let no_previous = AHashSet::new();
+
+        let gated = filter_navigation_live_voxels(&live, &no_previous, origin, 1.0, 5.0, 10.0, 4);
+        assert!(gated.contains(&(5, 0, 0)), "near hit must be immediate");
+        assert!(
+            !gated.contains(&(7, 0, 0)),
+            "an isolated first hit in the transition must wait for evidence"
+        );
+        assert!(
+            !gated.contains(&(11, 0, 0)),
+            "nothing beyond the navigation horizon may enter the local output"
+        );
+
+        assert_eq!(
+            filter_navigation_live_voxels(&live, &no_previous, origin, 1.0, 0.0, 0.0, 4),
+            live,
+            "zero max range must preserve the upstream behavior"
+        );
+    }
+
+    #[test]
+    fn navigation_live_gate_accepts_nearby_previous_hit_not_only_exact_voxel() {
+        let origin = (0.5, 0.5, 0.5);
+        let live: AHashSet<VoxelKey> = [(9, 0, 0)].into_iter().collect();
+        let within_two_voxels: AHashSet<VoxelKey> = [(7, 0, 0)].into_iter().collect();
+        let three_voxels_away: AHashSet<VoxelKey> = [(6, 0, 0)].into_iter().collect();
+
+        let accepted =
+            filter_navigation_live_voxels(&live, &within_two_voxels, origin, 1.0, 5.0, 10.0, 4);
+        assert!(accepted.contains(&(9, 0, 0)));
+
+        let rejected =
+            filter_navigation_live_voxels(&live, &three_voxels_away, origin, 1.0, 5.0, 10.0, 4);
+        assert!(!rejected.contains(&(9, 0, 0)));
+    }
+
+    #[test]
+    fn navigation_live_gate_raises_spatial_requirement_smoothly() {
+        let origin = (0.5, 0.5, 0.5);
+        // Seven metres is halfway through a 5-9 m transition, so smoothstep
+        // requires 0.5 evidence: two of four neighbors pass, one does not.
+        let one_neighbor: AHashSet<VoxelKey> = [(7, 0, 0), (7, 1, 0)].into_iter().collect();
+        let two_neighbors: AHashSet<VoxelKey> =
+            [(7, 0, 0), (7, 1, 0), (7, -1, 0)].into_iter().collect();
+        let no_previous = AHashSet::new();
+
+        let rejected =
+            filter_navigation_live_voxels(&one_neighbor, &no_previous, origin, 1.0, 5.0, 9.0, 4);
+        assert!(!rejected.contains(&(7, 0, 0)));
+
+        let accepted =
+            filter_navigation_live_voxels(&two_neighbors, &no_previous, origin, 1.0, 5.0, 9.0, 4);
+        assert!(accepted.contains(&(7, 0, 0)));
+    }
+
+    #[test]
+    fn navigation_ranges_must_be_ordered_when_enabled() {
+        use validator::Validate;
+
+        let cfg = Config {
+            local_immediate_range: 11.0,
+            local_navigation_max_range: 10.0,
+            ..basic_config()
+        };
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

@@ -110,6 +110,10 @@ impl VoxelRayMapper {
             graze_cos,
             support_min,
             local_max_age_frames,
+            // The offline mapper exposes the accumulated global map only, so
+            // navigation-only filtering must remain disabled here.
+            local_immediate_range: 0.0,
+            local_navigation_max_range: 0.0,
             emit_every: 1,
             global_emit_every: 1,
             region_percentile: 95.0,
