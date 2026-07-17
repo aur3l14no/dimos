@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from dimos_lcm.std_msgs import Bool  # type: ignore[import-untyped]
+
 from dimos.core.native_module import NativeModule, NativeModuleConfig
 from dimos.core.stream import In, Out
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
@@ -28,7 +30,9 @@ from dimos.spec import mapping
 class RayTracingVoxelMapConfig(NativeModuleConfig):
     cwd: str | None = "rust"
     executable: str = "result/bin/voxel_ray_tracing"
-    build_command: str | None = "nix build path:."
+    build_command: str | None = (
+        "nix build path:. --override-input dimos-rust path:../../../../native/rust"
+    )
     stdin_config: bool = True
 
     # Require odometry stamped exactly like each cloud. By default, wait for
@@ -53,6 +57,10 @@ class RayTracingVoxelMapConfig(NativeModuleConfig):
     # Occupied neighbors a surface voxel needs to appear in the local map. Zero
     # emits all. Higher drops isolated returns. The global map is unfiltered.
     support_min: int = 4
+    # Keep accumulated voxels in the local map for at most this many processed
+    # frames since their last hit. Zero preserves the full accumulated history.
+    # Current-frame hits and the global map are never filtered by this setting.
+    local_max_age_frames: int = 0
     # Publish the accumulated local map and region bounds every Nth frame. Zero disables them.
     emit_every: int = 1
     # Publish the global map every Nth frame. Zero disables it.
@@ -68,6 +76,7 @@ class RayTracingVoxelMap(NativeModule, mapping.GlobalPointcloud):
 
     lidar: In[PointCloud2]
     odometry: In[Odometry]
+    stop_global_map: In[Bool]
     global_map: Out[PointCloud2]
     local_map: Out[PointCloud2]
     region_bounds: Out[PoseStamped]

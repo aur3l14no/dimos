@@ -14,11 +14,11 @@
 
 """Holonomic trajectory controller.
 
-``DanHolonomicTC`` follows a planned ``Path`` with the holonomic tracking law.
+``HolonomicPathFollower`` follows a planned ``Path`` with the holonomic tracking law.
 It owns trajectory control only: the planner (``MLSPlannerNative``) owns route
 safety and emits the path, sending an empty ``Path`` when nothing ahead is
 traversable. The costmap, obstacle, and replanning concerns of the old
-``LocalPlanner`` are gone; the stripped control core (``_HolonomicPathFollower``)
+``LocalPlanner`` are gone; the stripped control core (``_HolonomicPathFollowerCore``)
 keeps the state machine, holonomic tracking, and run-profile envelope.
 """
 
@@ -67,7 +67,7 @@ from dimos.navigation.dannav.holonomic_tc.types import (
 from dimos.utils.logging_config import setup_logger
 from dimos.utils.trigonometry import angle_diff
 
-PlannerState: TypeAlias = Literal[
+FollowerState: TypeAlias = Literal[
     "idle", "initial_rotation", "path_following", "final_rotation", "arrived"
 ]
 # Only the two terminal reasons the controller still owns survive; the
@@ -88,11 +88,11 @@ class ActiveRunEnvelope:
     goal_decel_m_s2: float
 
 
-class _HolonomicPathFollower:
-    """Constructible control core for :class:`DanHolonomicTC`.
+class _HolonomicPathFollowerCore:
+    """Constructible control core for :class:`HolonomicPathFollower`.
 
     Owns the follow state machine, the holonomic tracking law, and the
-    run-profile speed/accel envelope. Has no transport: ``DanHolonomicTC`` wires
+    run-profile speed/accel envelope. Has no transport: ``HolonomicPathFollower`` wires
     the ``path`` / ``odometry`` / ``stop_movement`` streams to its methods and
     forwards ``cmd_vel`` / ``stopped_navigating``.
     """
@@ -106,8 +106,8 @@ class _HolonomicPathFollower:
     _current_odom: PoseStamped | None = None
 
     _lock: RLock
-    _stop_planning_event: Event
-    _state: PlannerState
+    _stop_following_event: Event
+    _state: FollowerState
     _global_config: GlobalConfig
     _goal_tolerance: float
     _controller: HolonomicPathController
@@ -124,14 +124,14 @@ class _HolonomicPathFollower:
     _align_heading_before_move: bool
     _align_goal_yaw: bool
 
-    def __init__(self, config: DanHolonomicTCConfig) -> None:
+    def __init__(self, config: HolonomicPathFollowerConfig) -> None:
         self.cmd_vel = Subject()
         self.stopped_navigating = Subject()
 
         self._config = config
         self._global_config = config.g
         self._lock = RLock()
-        self._stop_planning_event = Event()
+        self._stop_following_event = Event()
         self._state = "idle"
         self._goal_tolerance = float(config.goal_tolerance)
         self._orientation_tolerance = float(config.orientation_tolerance)
@@ -169,24 +169,24 @@ class _HolonomicPathFollower:
     # lifecycle
 
     def close(self) -> None:
-        self.stop_planning()
+        self.stop_following()
 
     def handle_odom(self, msg: PoseStamped) -> None:
         with self._lock:
             self._current_odom = msg
 
-    def start_planning(self, path: Path) -> None:
-        self.stop_planning()
+    def start_following(self, path: Path) -> None:
+        self.stop_following()
 
         with self._lock:
-            self._stop_planning_event = Event()
+            self._stop_following_event = Event()
             self._path = path
             self._path_distancer = PathDistancer(path)
             self._previous_odom_for_velocity = None
             self._rebuild_path_speed_profile(self._path_distancer)
             self._thread = Thread(
                 target=self._thread_entrypoint,
-                args=(self._stop_planning_event,),
+                args=(self._stop_following_event,),
                 daemon=True,
             )
             self._thread.start()
@@ -206,11 +206,11 @@ class _HolonomicPathFollower:
 
         return True
 
-    def stop_planning(self) -> None:
+    def stop_following(self) -> None:
         with self._lock:
             thread = self._thread
             self._thread = None
-            self._stop_planning_event.set()
+            self._stop_following_event.set()
 
         if thread is not None and thread is not current_thread():
             thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
@@ -312,13 +312,13 @@ class _HolonomicPathFollower:
             if owns_state:
                 self.cmd_vel.on_next(Twist())
 
-    def _change_state(self, new_state: PlannerState) -> None:
+    def _change_state(self, new_state: FollowerState) -> None:
         if new_state == self._state:
             return
         self._state = new_state
         logger.info("changed state", state=new_state)
 
-    def _initial_state(self, path: Path, current_odom: PoseStamped | None) -> PlannerState:
+    def _initial_state(self, path: Path, current_odom: PoseStamped | None) -> FollowerState:
         """Decide where the follow starts.
 
         A holonomic base translates while turning toward the path tangent, so by
@@ -351,7 +351,7 @@ class _HolonomicPathFollower:
             start_time = time.perf_counter()
 
             with self._lock:
-                state: PlannerState = self._state
+                state: FollowerState = self._state
 
             if state == "initial_rotation":
                 cmd_vel = self._compute_initial_rotation()
@@ -586,7 +586,7 @@ class _HolonomicPathFollower:
         )
 
 
-class DanHolonomicTCConfig(ModuleConfig):
+class HolonomicPathFollowerConfig(ModuleConfig):
     control_frequency: float = 10.0
     run_profile: str = "walk"
     speed_m_s: float | None = None
@@ -600,7 +600,7 @@ class DanHolonomicTCConfig(ModuleConfig):
     align_goal_yaw: bool = False
 
 
-class DanHolonomicTC(Module):
+class HolonomicPathFollower(Module):
     """Follow a planned ``Path`` with the holonomic tracking law.
 
     Consumes the robot's ``PoseStamped`` odom directly. The planner owns route
@@ -610,7 +610,7 @@ class DanHolonomicTC(Module):
     ``stop_movement`` cancels the current path.
     """
 
-    config: DanHolonomicTCConfig
+    config: HolonomicPathFollowerConfig
 
     path: In[Path]
     odom: In[PoseStamped]
@@ -621,7 +621,7 @@ class DanHolonomicTC(Module):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._core = _HolonomicPathFollower(self.config)
+        self._core = _HolonomicPathFollowerCore(self.config)
 
     @rpc
     def start(self) -> None:
@@ -646,14 +646,14 @@ class DanHolonomicTC(Module):
         # The planner owns path safety: it sends the route as far as it is safe,
         # or an empty path when nothing ahead is traversable.
         if len(path.poses) == 0:
-            self._core.stop_planning()
+            self._core.stop_following()
             return
         if not self._core.update_path(path):
-            self._core.start_planning(path)
+            self._core.start_following(path)
 
     def _on_stop(self, msg: Bool) -> None:
         if msg.data:
-            self._core.stop_planning()
+            self._core.stop_following()
 
     def _on_core_stopped(self, msg: StopMessage) -> None:
         if msg == "arrived":

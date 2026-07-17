@@ -94,7 +94,7 @@ def _find_safe_goal_bfs(
     gx, gy = int(goal_grid.x), int(goal_grid.y)
 
     # Convert distances to grid cells
-    clearance_cells = int(np.ceil(min_clearance / costmap.resolution))
+    clearance_radius_cells = min_clearance / costmap.resolution
     max_search_cells = int(np.ceil(max_search_distance / costmap.resolution))
 
     # BFS queue and visited set
@@ -113,7 +113,7 @@ def _find_safe_goal_bfs(
 
         # Check if position is valid
         if _is_position_safe(
-            costmap, x, y, cost_threshold, clearance_cells, connectivity_check_radius
+            costmap, x, y, cost_threshold, clearance_radius_cells, connectivity_check_radius
         ):
             # Convert back to world coordinates
             return costmap.grid_to_world((x, y))
@@ -159,7 +159,7 @@ def _find_safe_goal_bfs_contiguous(
     gx, gy = int(goal_grid.x), int(goal_grid.y)
 
     # Convert distances to grid cells
-    clearance_cells = int(np.ceil(min_clearance / costmap.resolution))
+    clearance_radius_cells = min_clearance / costmap.resolution
     max_search_cells = int(np.ceil(max_search_distance / costmap.resolution))
 
     # BFS queue and visited set
@@ -178,7 +178,7 @@ def _find_safe_goal_bfs_contiguous(
 
         # Check if position is valid
         if _is_position_safe(
-            costmap, x, y, cost_threshold, clearance_cells, connectivity_check_radius
+            costmap, x, y, cost_threshold, clearance_radius_cells, connectivity_check_radius
         ):
             # Convert back to world coordinates
             return costmap.grid_to_world((x, y))
@@ -190,8 +190,10 @@ def _find_safe_goal_bfs_contiguous(
             # Check bounds
             if 0 <= nx < costmap.width and 0 <= ny < costmap.height:
                 if (nx, ny) not in visited:
-                    # Only expand through passable cells (occupancy < 100)
-                    if costmap.grid[ny, nx] < 100:
+                    value = costmap.grid[ny, nx]
+                    # Follow the same passability rule used to validate the
+                    # goal. UNKNOWN is not contiguous known-free space.
+                    if value != CostValues.UNKNOWN and value < cost_threshold:
                         visited.add((nx, ny))
                         queue.append((nx, ny, dist + 1))
 
@@ -203,7 +205,7 @@ def _is_position_safe(
     x: int,
     y: int,
     cost_threshold: int,
-    clearance_cells: int,
+    clearance_radius_cells: float,
     connectivity_check_radius: int,
 ) -> bool:
     """
@@ -213,7 +215,7 @@ def _is_position_safe(
         costmap: The occupancy grid
         x, y: Grid coordinates to check
         cost_threshold: Maximum acceptable cost
-        clearance_cells: Minimum clearance in cells
+        clearance_radius_cells: Minimum clearance radius in cells
         connectivity_check_radius: Radius to check for connectivity
 
     Returns:
@@ -229,12 +231,15 @@ def _is_position_safe(
         return False
 
     # Check clearance around position
-    for dy in range(-clearance_cells, clearance_cells + 1):
-        for dx in range(-clearance_cells, clearance_cells + 1):
+    clearance_extent = int(np.ceil(clearance_radius_cells))
+    clearance_squared = clearance_radius_cells * clearance_radius_cells
+    clearance_tolerance = max(1e-9, clearance_squared * 1e-6)
+    for dy in range(-clearance_extent, clearance_extent + 1):
+        for dx in range(-clearance_extent, clearance_extent + 1):
             nx, ny = x + dx, y + dy
             if 0 <= nx < costmap.width and 0 <= ny < costmap.height:
                 # Check if within circular clearance
-                if dx * dx + dy * dy <= clearance_cells * clearance_cells:
+                if dx * dx + dy * dy <= clearance_squared + clearance_tolerance:
                     if costmap.grid[ny, nx] >= cost_threshold:
                         return False
 

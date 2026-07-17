@@ -71,7 +71,7 @@ def _handshake_noise_filter(record: logging.LogRecord) -> bool:
     return not ("opening handshake failed" in msg or "did not receive a valid HTTP request" in msg)
 
 
-class RerunWebSocketServer(Module):
+class RerunViewerInputServer(Module):
     """This handles outputs from dimos-viewer (like keyboard controls)"""
 
     clicked_point: Out[PointStamped]
@@ -91,7 +91,7 @@ class RerunWebSocketServer(Module):
 
     @property
     def port(self) -> int:
-        return self.config.g.rerun_websocket_server_port
+        return self.config.g.rerun_viewer_input_port
 
     @rpc
     def start(self) -> None:
@@ -131,7 +131,7 @@ class RerunWebSocketServer(Module):
             await websocket.close(1008, "Not Found")
             return
         addr = websocket.remote_address
-        logger.info(f"RerunWebSocketServer: viewer connected from {addr}")
+        logger.info(f"RerunViewerInputServer: viewer connected from {addr}")
         self.client_connected.set()
         try:
             async for raw in websocket:
@@ -143,7 +143,7 @@ class RerunWebSocketServer(Module):
         try:
             msg: dict[str, Any] = json.loads(raw)
         except json.JSONDecodeError:
-            logger.warning(f"RerunWebSocketServer: ignoring non-JSON message: {raw!r}")
+            logger.warning(f"RerunViewerInputServer: ignoring non-JSON message: {raw!r}")
             return
 
         if not isinstance(msg, dict):

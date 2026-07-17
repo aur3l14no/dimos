@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end tests for dimos-viewer ↔ RerunWebSocketServer protocol."""
+"""End-to-end tests for dimos-viewer ↔ RerunViewerInputServer protocol."""
 
 from __future__ import annotations
 
@@ -28,23 +28,23 @@ import websockets.asyncio.client as ws_client
 
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.global_config import global_config
-from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
+from dimos.visualization.rerun.viewer_input_server import RerunViewerInputServer
 
 _E2E_PORT = 13032
 
 
 @pytest.fixture()
-def server(wait_for_server: Any) -> RerunWebSocketServer:
-    original_port = global_config.rerun_websocket_server_port
-    global_config.update(rerun_websocket_server_port=_E2E_PORT)
+def server(wait_for_server: Any) -> RerunViewerInputServer:
+    original_port = global_config.rerun_viewer_input_port
+    global_config.update(rerun_viewer_input_port=_E2E_PORT)
     try:
-        module = RerunWebSocketServer()
+        module = RerunViewerInputServer()
         module.start()
         wait_for_server(_E2E_PORT)
         yield module
         module.stop()
     finally:
-        global_config.update(rerun_websocket_server_port=original_port)
+        global_config.update(rerun_viewer_input_port=original_port)
 
 
 def _send_messages(port: int, messages: list[dict[str, Any]], *, delay: float = 0.05) -> None:
@@ -60,7 +60,7 @@ def _send_messages(port: int, messages: list[dict[str, Any]], *, delay: float = 
 class TestViewerProtocolE2E:
     """Verify the Python-server side of the viewer ↔ DimOS protocol."""
 
-    def test_viewer_click_reaches_stream(self, server: RerunWebSocketServer) -> None:
+    def test_viewer_click_reaches_stream(self, server: RerunViewerInputServer) -> None:
         """A viewer click over WebSocket publishes PointStamped."""
         received: list[Any] = []
         done = threading.Event()
@@ -94,7 +94,7 @@ class TestViewerProtocolE2E:
         assert point.frame_id == "/world/robot"
         assert point.ts == pytest.approx(42.0)
 
-    def test_full_viewer_session_sequence(self, server: RerunWebSocketServer) -> None:
+    def test_full_viewer_session_sequence(self, server: RerunViewerInputServer) -> None:
         """Realistic session: heartbeats, click, twist, stop — only the click produces a point."""
         received: list[Any] = []
         done = threading.Event()
@@ -139,7 +139,7 @@ class TestViewerProtocolE2E:
         assert received[0].y == pytest.approx(2.71)
         assert received[0].z == pytest.approx(1.41)
 
-    def test_reconnect_after_disconnect(self, server: RerunWebSocketServer) -> None:
+    def test_reconnect_after_disconnect(self, server: RerunViewerInputServer) -> None:
         """Server keeps accepting new connections after a client disconnects."""
         received: list[Any] = []
         all_done = threading.Event()
@@ -190,7 +190,7 @@ class TestViewerBinaryConnectMode:
     """Smoke test: dimos-viewer binary starts in --connect mode."""
 
     @pytest.fixture()
-    def viewer_process(self, server: RerunWebSocketServer) -> subprocess.Popen[bytes]:
+    def viewer_process(self, server: RerunViewerInputServer) -> subprocess.Popen[bytes]:
         if not os.environ.get("DISPLAY"):
             pytest.skip("dimos-viewer requires a display (winit cannot start without one)")
         process = subprocess.Popen(
@@ -210,7 +210,7 @@ class TestViewerBinaryConnectMode:
             process.kill()
 
     def test_viewer_ws_client_connects(
-        self, server: RerunWebSocketServer, viewer_process: subprocess.Popen[bytes]
+        self, server: RerunViewerInputServer, viewer_process: subprocess.Popen[bytes]
     ) -> None:
         """dimos-viewer --connect starts and its WS client connects to our server."""
         connected = server.client_connected.wait(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)

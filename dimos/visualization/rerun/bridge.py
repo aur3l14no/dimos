@@ -464,7 +464,7 @@ class RerunBridgeModule(Module):
         """Log CLI commands for connecting a viewer to this bridge."""
         local_ips = get_local_ips()
         local_grpc = f"rerun+http://{self.host}:{grpc_port}/proxy"
-        local_ws = f"ws://{self.host}:{self.config.g.rerun_websocket_server_port}/ws"
+        local_ws = f"ws://{self.host}:{self.config.g.rerun_viewer_input_port}/ws"
         hostname = socket.gethostname()
 
         columns = 60
@@ -478,7 +478,7 @@ class RerunBridgeModule(Module):
         ]
         for ip, iface in local_ips:
             remote_grpc = f"rerun+http://{ip}:{grpc_port}/proxy"
-            remote_ws = f"ws://{ip}:{self.config.g.rerun_websocket_server_port}/ws"
+            remote_ws = f"ws://{ip}:{self.config.g.rerun_viewer_input_port}/ws"
             lines.append(f"  dimos-viewer --connect {remote_grpc} --ws-url {remote_ws}  # {iface}")
         lines.append("")
         lines.append(f"  hostname: {hostname}")

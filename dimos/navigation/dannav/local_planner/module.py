@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Path-stream middleware between ``MLSPlannerNative`` and ``DanHolonomicTC``.
+"""Path-stream middleware between ``MLSPlannerNative`` and ``HolonomicPathFollower``.
 
 ``MLSPlannerNative`` re-roots and re-emits a path on every lidar frame: the
 stream is sparse, unsmoothed, and unthrottled.
@@ -26,7 +26,7 @@ stream is sparse, unsmoothed, and unthrottled.
 and forwards a fresh planner path only when the robot has advanced
 ``lock_replan`` metres along the committed path, when a clicked goal first
 lands, on cold start, or on a stop. Between commits it suppresses replans so
-``DanHolonomicTC`` keeps a stable lookahead. Each committed path is smoothed
+``HolonomicPathFollower`` keeps a stable lookahead. Each committed path is smoothed
 and uniformly resampled inside :meth:`_ReplanGate._commit` before it is stored
 and forwarded.
 """
@@ -71,8 +71,8 @@ class _ReplanGate:
     """Transport-free core deciding which planner paths reach the follower.
 
     Owns the gate state and the commit decision, so it is unit-testable directly
-    the way ``_HolonomicPathFollower`` is. It forwards a planner path only at
-    *commit* moments and suppresses replans in between, so ``DanHolonomicTC``
+    the way ``_HolonomicPathFollowerCore`` is. It forwards a planner path only at
+    *commit* moments and suppresses replans in between, so ``HolonomicPathFollower``
     follows the last committed path over a guaranteed-stable lookahead instead of
     being yanked onto a freshly re-rooted chord every lidar frame.
 
@@ -91,7 +91,7 @@ class _ReplanGate:
         # xy of the most recent finite click, armed until a path ends at it
         # (fresh-click commit) or a cancel disarms it.
         self._armed_goal: NDArray[np.float64] | None = None
-        # PathDistancer over the path DanHolonomicTC is currently following, and
+        # PathDistancer over the path HolonomicPathFollower is currently following, and
         # the robot's arc-length on it at commit time (~0 since MLS roots the
         # path at the robot). None means nothing committed (cold start / stop).
         self._committed: PathDistancer | None = None
@@ -205,11 +205,11 @@ def _ends_near(path: Path, goal_xy: NDArray[np.float64], tolerance_m: float) -> 
 
 
 class DanLocalPlanner(Module):
-    """Gate and shape ``MLSPlannerNative``'s path stream for ``DanHolonomicTC``.
+    """Gate and shape ``MLSPlannerNative``'s path stream for ``HolonomicPathFollower``.
 
     Sits between the planner output (remapped to ``planner_path``) and the
     follower's ``path`` input. Forwards the paths :class:`_ReplanGate` commits
-    unchanged to ``DanHolonomicTC``.
+    unchanged to ``HolonomicPathFollower``.
     """
 
     config: DanLocalPlannerConfig
@@ -218,7 +218,7 @@ class DanLocalPlanner(Module):
     odom: In[PoseStamped]  # from GO2Connection.odom
     goal: In[PointStamped]  # from MovementManager.goal; the click/cancel signal
 
-    path: Out[Path]  # to DanHolonomicTC.path
+    path: Out[Path]  # to HolonomicPathFollower.path
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)

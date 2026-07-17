@@ -215,15 +215,17 @@ def height_cost_occupancy(cloud: PointCloud2, **kwargs: Any) -> OccupancyGrid:
     height_gap = max_height_map - min_height_map
     height_map = np.where(height_gap > cfg.can_pass_under, min_height_map, max_height_map)
 
-    # Track which cells have observations
-    observed_mask = ~np.isnan(height_map)
+    # Keep direct observations separate from interpolated gradient context. Only
+    # cells backed by point-cloud samples may be emitted as observed costs.
+    direct_observed_mask = ~np.isnan(height_map)
+    gradient_context_mask = direct_observed_mask
 
     # Step 3: Apply smoothing to fill gaps while preserving unknown space
-    if cfg.smoothing > 0 and np.any(observed_mask):
+    if cfg.smoothing > 0 and np.any(direct_observed_mask):
         # Use a weighted smoothing approach that only interpolates from known cells
         # Create a weight map (1 for observed, 0 for unknown)
-        weights = observed_mask.astype(np.float32)
-        height_map_filled = np.where(observed_mask, height_map, 0.0)
+        weights = direct_observed_mask.astype(np.float32)
+        height_map_filled = np.where(direct_observed_mask, height_map, 0.0)
 
         # Smooth both height values and weights
         smoothed_heights = ndimage.gaussian_filter(height_map_filled, sigma=cfg.smoothing)
@@ -235,16 +237,17 @@ def height_cost_occupancy(cloud: PointCloud2, **kwargs: Any) -> OccupancyGrid:
         np.divide(smoothed_heights, smoothed_weights, out=height_map_smoothed, where=valid_smooth)
 
         # Keep original values where we had observations, use smoothed elsewhere
-        height_map = np.where(observed_mask, height_map, height_map_smoothed)
+        height_map = np.where(direct_observed_mask, height_map, height_map_smoothed)
 
-        # Update observed mask to include smoothed cells
-        observed_mask = ~np.isnan(height_map)
+        # Interpolated cells provide neighborhood context for gradient calculation,
+        # but remain unknown in the returned occupancy grid.
+        gradient_context_mask = ~np.isnan(height_map)
 
     # Step 4: Calculate rate of change (gradient magnitude)
     # Use Sobel filters for gradient calculation
-    if np.any(observed_mask):
+    if np.any(gradient_context_mask):
         # Replace NaN with 0 for gradient calculation
-        height_for_grad = np.where(observed_mask, height_map, 0.0)
+        height_for_grad = np.where(gradient_context_mask, height_map, 0.0)
 
         # Calculate gradients (Sobel gives gradient in pixels, scale by resolution)
         grad_x = ndimage.sobel(height_for_grad, axis=1) / (8.0 * cfg.resolution)
@@ -265,10 +268,12 @@ def height_cost_occupancy(cloud: PointCloud2, **kwargs: Any) -> OccupancyGrid:
         cost_float = (height_change_per_cell / cfg.can_climb) * 100.0
         cost_float = np.clip(cost_float, 0, 100)
 
-        # Erode observed mask - only trust gradients where all neighbors are observed
-        # This prevents false high costs at boundaries with unknown regions
+        # Trust directly observed cells only where all neighbors provide gradient context.
+        # This prevents false high costs at boundaries with unknown regions.
         structure = ndimage.generate_binary_structure(2, 1)  # 4-connectivity
-        valid_gradient_mask = ndimage.binary_erosion(observed_mask, structure=structure)
+        valid_gradient_mask = direct_observed_mask & ndimage.binary_erosion(
+            gradient_context_mask, structure=structure
+        )
 
         # Convert to int8, marking cells without valid gradients as -1
         cost = np.where(valid_gradient_mask, cost_float.astype(np.int8), -1)

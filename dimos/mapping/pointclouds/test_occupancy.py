@@ -128,3 +128,25 @@ def test_height_cost_occupancy_from_lidar(height_cost_moment) -> None:
     known_mask = costmap.grid >= 0
     assert known_mask.sum() > 0, "Expected some known cells"
     assert (~known_mask).sum() > 0, "Expected some unknown cells"
+
+
+def test_height_cost_smoothing_does_not_observe_interpolated_cells() -> None:
+    points = np.array(
+        [[x, y, 0.2 * x] for y in (0.0, 0.5, 1.0) for x in (0.0, 0.5, 1.0)],
+        dtype=np.float32,
+    )
+    cloud = PointCloud2.from_numpy(points, frame_id="map")
+
+    costmap = height_cost_occupancy(
+        cloud,
+        resolution=0.5,
+        smoothing=1.0,
+        ignore_noise=0.01,
+        can_climb=0.15,
+    )
+
+    directly_observed = np.zeros((6, 6), dtype=bool)
+    directly_observed[2:5, 2:5] = True
+
+    np.testing.assert_array_equal(costmap.grid >= 0, directly_observed)
+    assert np.all(costmap.grid[directly_observed] > 0)

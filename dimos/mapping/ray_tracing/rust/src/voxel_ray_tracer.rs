@@ -50,6 +50,10 @@ pub struct Config {
     /// emits all. Higher drops isolated returns. The global map is unfiltered.
     #[validate(range(min = 0))]
     pub support_min: i32,
+    /// Maximum processed-frame age of accumulated voxels emitted in the local
+    /// map. Zero keeps the full accumulated history. Current-frame hits and the
+    /// global map are unfiltered.
+    pub local_max_age_frames: u32,
     /// Publish the accumulated local map and region bounds every Nth frame. Zero disables them.
     #[validate(range(min = 0))]
     pub emit_every: u32,
@@ -72,6 +76,7 @@ fn validate_health_range(cfg: &Config) -> Result<(), ValidationError> {
 #[derive(Default)]
 pub struct VoxelMap {
     pub voxels: AHashMap<VoxelKey, Voxel>,
+    frame: u64,
 }
 
 impl VoxelMap {
@@ -136,6 +141,7 @@ pub struct Voxel {
     sum: Vector3<f32>,
     m2: Matrix3<f32>,
     normal: Option<Vector3<f32>>,
+    last_hit_frame: u64,
 }
 
 impl Default for Voxel {
@@ -146,6 +152,7 @@ impl Default for Voxel {
             sum: Vector3::zeros(),
             m2: Matrix3::zeros(),
             normal: None,
+            last_hit_frame: 0,
         }
     }
 }
@@ -430,15 +437,17 @@ fn has_support(voxels: &AHashMap<VoxelKey, Voxel>, key: VoxelKey, support_min: i
     false
 }
 
-/// Points for an emitted cloud: healthy surface voxels within `bounds` (all
-/// when `None`) with at least `support_min` occupied neighbors, plus this
-/// frame's not-yet-healthy `live` voxels within `bounds`.
+/// Points for an emitted cloud: sufficiently recent healthy surface voxels
+/// within `bounds` (all when `None`) with at least `support_min` occupied
+/// neighbors, plus this frame's not-yet-healthy `live` voxels within `bounds`.
+/// A zero `max_age_frames` preserves the full accumulated history.
 pub fn emit_points(
     map: &VoxelMap,
     voxel_size: f32,
     bounds: Option<&LocalBounds>,
     support_min: i32,
     live: &AHashSet<VoxelKey>,
+    max_age_frames: u32,
 ) -> Vec<(f32, f32, f32)> {
     let half = voxel_size * 0.5;
     let center = |(kx, ky, kz): VoxelKey| {
@@ -453,6 +462,11 @@ pub fn emit_points(
     let mut out = Vec::with_capacity(map.voxels.len() + live.len());
     for (&key, c) in map.voxels.iter() {
         if c.health <= 0 {
+            continue;
+        }
+        if max_age_frames > 0
+            && map.frame.saturating_sub(c.last_hit_frame) >= u64::from(max_age_frames)
+        {
             continue;
         }
         let (x, y, z) = center(key);
@@ -492,6 +506,8 @@ pub fn update_map(
     points: &[(f32, f32, f32)],
     cfg: &Config,
 ) -> AHashSet<VoxelKey> {
+    map.frame = map.frame.saturating_add(1);
+    let frame = map.frame;
     let inv = 1.0_f32 / cfg.voxel_size;
     let max_range_sq = if cfg.max_range > 0.0 {
         cfg.max_range * cfg.max_range
@@ -554,6 +570,7 @@ pub fn update_map(
             ..Default::default()
         });
         c.health = (c.health + 1).min(cfg.max_health);
+        c.last_hit_frame = frame;
     }
 
     for &p in points {
@@ -734,6 +751,7 @@ mod tests {
             max_health: 1,
             graze_cos: 0.5,
             support_min: 0,
+            local_max_age_frames: 0,
             emit_every: 1,
             global_emit_every: 1,
             region_percentile: 95.0,
@@ -942,6 +960,7 @@ mod tests {
             max_health: 1,
             graze_cos: 0.5,
             support_min: 0,
+            local_max_age_frames: 0,
             emit_every: 1,
             global_emit_every: 1,
             region_percentile: 95.0,
@@ -1098,6 +1117,7 @@ mod tests {
             max_health: 1,
             graze_cos: 0.5,
             support_min: 0,
+            local_max_age_frames: 0,
             emit_every: 1,
             global_emit_every: 1,
             region_percentile: 95.0,
@@ -1173,6 +1193,7 @@ mod tests {
             max_health: 1,
             graze_cos: 0.5,
             support_min: 0,
+            local_max_age_frames: 0,
             emit_every: 1,
             global_emit_every: 1,
             region_percentile: 95.0,
@@ -1236,6 +1257,7 @@ mod tests {
             max_health: 1,
             graze_cos,
             support_min: 0,
+            local_max_age_frames: 0,
             emit_every: 1,
             global_emit_every: 1,
             region_percentile: 95.0,
@@ -1368,6 +1390,7 @@ mod tests {
             max_health: 1,
             graze_cos: 0.5,
             support_min: 0,
+            local_max_age_frames: 0,
             emit_every: 1,
             global_emit_every: 1,
             region_percentile: 95.0,
@@ -1406,19 +1429,71 @@ mod tests {
         let no_live = AHashSet::new();
         // support_min 0 emits every surface voxel.
         assert_eq!(
-            emit_points(&map, voxel_size, Some(&bounds), 0, &no_live).len(),
+            emit_points(&map, voxel_size, Some(&bounds), 0, &no_live, 0).len(),
             10
         );
 
         // Every patch cell has at least 3 surface neighbors (the corners exactly
         // 3), so support_min 3 keeps the patch and drops only the isolated voxel.
-        let gated = emit_points(&map, voxel_size, Some(&bounds), 3, &no_live);
+        let gated = emit_points(&map, voxel_size, Some(&bounds), 3, &no_live, 0);
         assert_eq!(gated.len(), 9);
         let half = voxel_size * 0.5;
         let isolated = (20.0 + half, 20.0 + half, half);
         assert!(
             !gated.contains(&isolated),
             "isolated voxel must be gated out"
+        );
+    }
+
+    #[test]
+    fn local_age_gate_hides_stale_voxel_without_removing_it() {
+        let cfg = basic_config();
+        let origin = (0.5, 0.5, 0.5);
+        let stale = (5.5, 0.5, 0.5);
+        let unrelated = (0.5, 5.5, 0.5);
+        let mut map = VoxelMap::default();
+
+        update_map(&mut map, origin, &[stale], &cfg);
+        update_map(&mut map, origin, &[unrelated], &cfg);
+        let live = update_map(&mut map, origin, &[unrelated], &cfg);
+
+        assert_eq!(map.health((5, 0, 0)), Some(1));
+        assert!(
+            emit_points(&map, 1.0, None, 0, &live, 0).contains(&stale),
+            "zero max age must preserve accumulated global-map behavior"
+        );
+        assert!(
+            !emit_points(&map, 1.0, None, 0, &live, 2).contains(&stale),
+            "a voxel not hit for the configured frame window must leave the local map"
+        );
+        assert_eq!(
+            map.health((5, 0, 0)),
+            Some(1),
+            "local expiry must not mutate the accumulated map"
+        );
+
+        let live = update_map(&mut map, origin, &[stale], &cfg);
+        assert!(
+            emit_points(&map, 1.0, None, 0, &live, 2).contains(&stale),
+            "a new hit must refresh an expired voxel immediately"
+        );
+    }
+
+    #[test]
+    fn local_age_gate_keeps_current_unconfirmed_hit() {
+        let cfg = Config {
+            min_health: -1,
+            ..basic_config()
+        };
+        let origin = (0.5, 0.5, 0.5);
+        let hit = (5.5, 0.5, 0.5);
+        let mut map = VoxelMap::default();
+        let live = update_map(&mut map, origin, &[hit], &cfg);
+
+        assert_eq!(map.health((5, 0, 0)), Some(0));
+        assert!(
+            emit_points(&map, 1.0, None, 0, &live, 1).contains(&hit),
+            "current hits must bypass health, support, and age gates"
         );
     }
 }

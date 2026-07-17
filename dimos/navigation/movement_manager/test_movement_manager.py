@@ -112,6 +112,22 @@ def test_valid_click_publishes_goal(manager_and_captured):
     assert captured.way_point == [click]
 
 
+def test_way_point_publication_can_be_disabled():
+    manager = MovementManager(publish_way_point=False)
+    captured, unsubs = _attach(manager)
+    try:
+        click = _click()
+        manager._on_click(click)
+        manager._cancel_goal()
+        assert captured.goal[0] is click
+        assert math.isnan(captured.goal[1].x)
+        assert captured.way_point == []
+    finally:
+        for unsub in unsubs:
+            unsub()
+        manager._close_module()
+
+
 def test_invalid_clicks_rejected(manager_and_captured):
     """NaN, Inf, and out-of-range clicks should not publish."""
     manager, captured = manager_and_captured

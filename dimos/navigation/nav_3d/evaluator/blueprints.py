@@ -36,7 +36,7 @@ from dimos.navigation.cmu_nav.modules.click_start_goal_router.click_start_goal_r
 from dimos.navigation.nav_3d.evaluator.evaluator import Evaluator
 from dimos.navigation.nav_3d.mls_planner.mls_planner_native import MLSPlannerNative
 from dimos.visualization.rerun.bridge import RerunBridgeModule
-from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
+from dimos.visualization.rerun.viewer_input_server import RerunViewerInputServer
 
 _POSE_MARKER_RADIUS = 0.4
 # Small lift so graph artifacts render visibly above the surface points instead of z-fighting.
@@ -103,7 +103,7 @@ path_planner_eval = autoconnect(
     Evaluator.blueprint(),
     MLSPlannerNative.blueprint(),
     ClickStartGoalRouter.blueprint(),
-    RerunWebSocketServer.blueprint(),
+    RerunViewerInputServer.blueprint(),
     RerunBridgeModule.blueprint(
         visual_override={
             "world/start_pose": _render_start_pose,

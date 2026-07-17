@@ -14,8 +14,8 @@
 
 """Named Go2 movement envelopes (speed and limit caps).
 
-Data and validation only. Live wiring: ``DanHolonomicTCConfig.run_profile`` and
-``_HolonomicPathFollower._resolve_run_envelope``.
+Data and validation only. Live wiring: ``HolonomicPathFollowerConfig.run_profile`` and
+``_HolonomicPathFollowerCore._resolve_run_envelope``.
 """
 
 from __future__ import annotations

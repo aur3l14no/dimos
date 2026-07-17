@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``DanHolonomicTC`` module integration: cancel inputs, path hot-swap, arrival."""
+"""``HolonomicPathFollower`` integration: cancel inputs, path hot-swap, arrival."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ from dimos.msgs.geometry_msgs.Quaternion import Quaternion
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.nav_msgs.Path import Path
 from dimos.navigation.base import NavigationState
-from dimos.navigation.dannav.holonomic_tc.module import DanHolonomicTC
+from dimos.navigation.dannav.holonomic_tc.path_follower import HolonomicPathFollower
 
 _CancelVia = Literal["empty_path", "stop_movement"]
 
@@ -122,7 +122,7 @@ def _wait_until(predicate: Callable[[], bool], timeout: float = 2.0) -> bool:
 
 class _ModuleHarness:
     def __init__(
-        self, module: DanHolonomicTC, captured: _Captured, unsubs: list[Callable[[], None]]
+        self, module: HolonomicPathFollower, captured: _Captured, unsubs: list[Callable[[], None]]
     ) -> None:
         self.module = module
         self.captured = captured
@@ -148,7 +148,7 @@ class _ModuleHarness:
 
 @contextmanager
 def _running_module(**config: Any) -> Iterator[_ModuleHarness]:
-    module = DanHolonomicTC(**config)
+    module = HolonomicPathFollower(**config)
     module.path.transport = _DirectTransport()
     module.odom.transport = _DirectTransport()
     module.stop_movement.transport = _DirectTransport()

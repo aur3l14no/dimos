@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::Duration;
 
 use cloud_pose_matcher::{CloudPoseMatcher, MatchOutcome};
@@ -23,7 +26,7 @@ use dimos_voxel_ray_tracing::voxel_ray_tracer::{
 use lcm_msgs::geometry_msgs::{Point, Pose, PoseStamped, Quaternion};
 use lcm_msgs::nav_msgs::Odometry;
 use lcm_msgs::sensor_msgs::{PointCloud2, PointField};
-use lcm_msgs::std_msgs::{Header, Time};
+use lcm_msgs::std_msgs::{Bool, Header, Time};
 use nalgebra::{UnitQuaternion, Vector3};
 use tokio::sync::Notify;
 
@@ -110,6 +113,11 @@ struct RayTracingVoxelMap {
     #[input(decode = Odometry::decode, handler = on_odometry)]
     odometry: Input<Odometry>,
 
+    /// Permanently stop publishing the accumulated map for this run. Mapping
+    /// and local-map publication continue normally.
+    #[input(decode = Bool::decode, handler = on_stop_global_map)]
+    stop_global_map: Input<Bool>,
+
     #[output(encode = PointCloud2::encode)]
     global_map: Output<PointCloud2>,
 
@@ -126,14 +134,17 @@ struct RayTracingVoxelMap {
 
     cloud_pose_matcher: CloudPoseMatcher,
     latest_job: Arc<LatestSlot<MapJob>>,
+    global_map_stopped: Arc<AtomicBool>,
     worker: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RayTracingVoxelMap {
     async fn spawn_worker(&mut self) {
+        self.global_map_stopped.store(false, Ordering::Relaxed);
         let worker = MapWorker {
             latest_job: Arc::clone(&self.latest_job),
             config: self.config.clone(),
+            global_map_stopped: Arc::clone(&self.global_map_stopped),
             global_map: self.global_map.clone(),
             local_map: self.local_map.clone(),
             region_bounds: self.region_bounds.clone(),
@@ -180,6 +191,12 @@ impl RayTracingVoxelMap {
             );
         }
         self.handle_match_outcome(result.outcome);
+    }
+
+    async fn on_stop_global_map(&mut self, msg: Bool) {
+        if msg.data {
+            self.global_map_stopped.store(true, Ordering::Relaxed);
+        }
     }
 
     fn handle_match_outcome(&self, outcome: MatchOutcome) {
@@ -259,6 +276,7 @@ struct MapOutputs {
 struct MapWorker {
     latest_job: Arc<LatestSlot<MapJob>>,
     config: Config,
+    global_map_stopped: Arc<AtomicBool>,
     global_map: Output<PointCloud2>,
     local_map: Output<PointCloud2>,
     region_bounds: Output<PoseStamped>,
@@ -288,7 +306,9 @@ impl MapWorker {
             }
         }
         if let Some(global) = outputs.global {
-            publish_cloud(&self.global_map, &global).await;
+            if !self.global_map_stopped.load(Ordering::Relaxed) {
+                publish_cloud(&self.global_map, &global).await;
+            }
         }
         if let Some(local) = outputs.local {
             publish_cloud(&self.local_map, &local).await;
@@ -390,13 +410,14 @@ impl MapWorker {
         };
 
         let stamp = cloud.header.stamp;
-        let global_due = emit_due_or_frame_change(
+        let global_due = global_emit_due(
             state.frame_count,
             self.config.global_emit_every,
             parent_changed,
+            self.global_map_stopped.load(Ordering::Relaxed),
         );
         let global = global_due.then(|| {
-            let points = emit_points(&state.map, voxel_size, None, 0, &live);
+            let points = emit_points(&state.map, voxel_size, None, 0, &live, 0);
             points_to_cloud(&points, out_frame_id, stamp.clone())
         });
         let local = cylinder.as_ref().map(|bounds| {
@@ -406,6 +427,7 @@ impl MapWorker {
                 Some(bounds),
                 self.config.support_min,
                 &live,
+                self.config.local_max_age_frames,
             );
             points_to_cloud(&points, out_frame_id, stamp)
         });
@@ -427,6 +449,10 @@ fn emit_due(frame_count: u32, every: u32) -> bool {
 /// waiting for the next periodic emission. Zero still disables the output.
 fn emit_due_or_frame_change(frame_count: u32, every: u32, frame_changed: bool) -> bool {
     every != 0 && (frame_changed || emit_due(frame_count, every))
+}
+
+fn global_emit_due(frame_count: u32, every: u32, frame_changed: bool, stopped: bool) -> bool {
+    !stopped && emit_due_or_frame_change(frame_count, every, frame_changed)
 }
 
 struct ExtractError(&'static str);
@@ -634,6 +660,11 @@ mod tests {
         assert!(emit_due_or_frame_change(1, 50, true));
         assert!(!emit_due_or_frame_change(1, 50, false));
         assert!(!emit_due_or_frame_change(1, 0, true));
+
+        assert!(global_emit_due(2, 2, false, false));
+        assert!(global_emit_due(1, 50, true, false));
+        assert!(!global_emit_due(2, 2, false, true));
+        assert!(!global_emit_due(1, 50, true, true));
     }
 
     #[test]
@@ -649,12 +680,12 @@ mod tests {
             z_max: 1.0,
         };
         let global = points_to_cloud(
-            &emit_points(&map, 1.0, None, 0, &live),
+            &emit_points(&map, 1.0, None, 0, &live, 0),
             "world",
             Time::default(),
         );
         let local = points_to_cloud(
-            &emit_points(&map, 1.0, Some(&cylinder), 0, &live),
+            &emit_points(&map, 1.0, Some(&cylinder), 0, &live, 0),
             "world",
             Time::default(),
         );
@@ -675,12 +706,12 @@ mod tests {
             z_max: 10.0,
         };
         let global = points_to_cloud(
-            &emit_points(&map, 1.0, None, 0, &live),
+            &emit_points(&map, 1.0, None, 0, &live, 0),
             "world",
             Time::default(),
         );
         let local = points_to_cloud(
-            &emit_points(&map, 1.0, Some(&cylinder), 0, &live),
+            &emit_points(&map, 1.0, Some(&cylinder), 0, &live, 0),
             "world",
             Time::default(),
         );
@@ -702,12 +733,12 @@ mod tests {
             z_max: 1.0,
         };
         let global = points_to_cloud(
-            &emit_points(&map, 1.0, None, 0, &live),
+            &emit_points(&map, 1.0, None, 0, &live, 0),
             "world",
             Time::default(),
         );
         let local = points_to_cloud(
-            &emit_points(&map, 1.0, Some(&cylinder), 0, &live),
+            &emit_points(&map, 1.0, Some(&cylinder), 0, &live, 0),
             "world",
             Time::default(),
         );
@@ -730,12 +761,12 @@ mod tests {
             z_max: 1.0,
         };
         let global = points_to_cloud(
-            &emit_points(&map, 1.0, None, 0, &live),
+            &emit_points(&map, 1.0, None, 0, &live, 0),
             "world",
             Time::default(),
         );
         let local = points_to_cloud(
-            &emit_points(&map, 1.0, Some(&cylinder), 0, &live),
+            &emit_points(&map, 1.0, Some(&cylinder), 0, &live, 0),
             "world",
             Time::default(),
         );
@@ -766,7 +797,7 @@ mod tests {
             z_max: 10.0,
         };
         let local = points_to_cloud(
-            &emit_points(&map, 1.0, Some(&cylinder), 3, &live),
+            &emit_points(&map, 1.0, Some(&cylinder), 3, &live, 0),
             "world",
             Time::default(),
         );

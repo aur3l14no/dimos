@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Closed-loop ``_HolonomicPathFollower`` integration tests.
+"""Closed-loop ``_HolonomicPathFollowerCore`` integration tests.
 
 Math for profiling, tracking, and command limits lives in sibling unit tests.
 Here: path in -> cmd_vel out -> simulated plant -> arrival / caps / branches.
@@ -31,10 +31,10 @@ from dimos.msgs.nav_msgs.Path import Path
 from dimos.navigation.dannav.geometry.path_speed_profile import (
     PathSpeedProfileLimits,
 )
-from dimos.navigation.dannav.holonomic_tc.module import (
+from dimos.navigation.dannav.holonomic_tc.path_follower import (
     ActiveRunEnvelope,
-    DanHolonomicTCConfig,
-    _HolonomicPathFollower,
+    HolonomicPathFollowerConfig,
+    _HolonomicPathFollowerCore,
 )
 from dimos.navigation.dannav.holonomic_tc.run_profiles import RunProfile
 
@@ -69,12 +69,12 @@ def _path_from_points(points: list[tuple[float, float]]) -> Path:
     return Path(frame_id="map", poses=poses)
 
 
-def _make_follower(**overrides: object) -> _HolonomicPathFollower:
-    return _HolonomicPathFollower(DanHolonomicTCConfig(**overrides))
+def _make_follower(**overrides: object) -> _HolonomicPathFollowerCore:
+    return _HolonomicPathFollowerCore(HolonomicPathFollowerConfig(**overrides))
 
 
 def _install_envelope(
-    core: _HolonomicPathFollower,
+    core: _HolonomicPathFollowerCore,
     *,
     speed_m_s: float,
     max_tangent_accel_m_s2: float,
@@ -114,7 +114,7 @@ class _RunResult:
 
 
 def _run_follower(
-    core: _HolonomicPathFollower,
+    core: _HolonomicPathFollowerCore,
     *,
     points: list[tuple[float, float]],
     initial_yaw_rad: float = 0.0,
@@ -138,7 +138,7 @@ def _run_follower(
 
     try:
         core.handle_odom(_pose_stamped(plant_x_m, plant_y_m, plant_yaw_rad, ts=sim_time_s))
-        core.start_planning(_path_from_points(points))
+        core.start_following(_path_from_points(points))
         for _ in range(max_ticks):
             if "arrived" in stop_messages:
                 break

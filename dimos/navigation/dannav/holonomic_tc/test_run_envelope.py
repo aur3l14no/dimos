@@ -27,9 +27,9 @@ from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Quaternion import Quaternion
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.nav_msgs.Path import Path
-from dimos.navigation.dannav.holonomic_tc.module import (
-    DanHolonomicTCConfig,
-    _HolonomicPathFollower,
+from dimos.navigation.dannav.holonomic_tc.path_follower import (
+    HolonomicPathFollowerConfig,
+    _HolonomicPathFollowerCore,
 )
 
 
@@ -59,8 +59,8 @@ def _path_from_points(points: list[tuple[float, float]]) -> Path:
     return Path(frame_id="map", poses=poses)
 
 
-def _make_follower(**overrides: object) -> _HolonomicPathFollower:
-    return _HolonomicPathFollower(DanHolonomicTCConfig(**overrides))
+def _make_follower(**overrides: object) -> _HolonomicPathFollowerCore:
+    return _HolonomicPathFollowerCore(HolonomicPathFollowerConfig(**overrides))
 
 
 def _planar_speed_m_s(cmd: Twist) -> float:
@@ -68,7 +68,7 @@ def _planar_speed_m_s(cmd: Twist) -> float:
 
 
 def _closed_loop_max_planar_speed(
-    core: _HolonomicPathFollower,
+    core: _HolonomicPathFollowerCore,
     *,
     rate_hz: float = 60.0,
     max_ticks: int = 420,
@@ -90,7 +90,7 @@ def _closed_loop_max_planar_speed(
 
     try:
         core.handle_odom(_pose_stamped(plant_x_m, plant_y_m, plant_yaw_rad, ts=sim_time_s))
-        core.start_planning(_path_from_points([(0.1, 0.0), (3.1, 0.0)]))
+        core.start_following(_path_from_points([(0.1, 0.0), (3.1, 0.0)]))
         for _ in range(max_ticks):
             if "arrived" in stops:
                 break

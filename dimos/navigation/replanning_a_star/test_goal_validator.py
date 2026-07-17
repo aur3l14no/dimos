@@ -51,3 +51,67 @@ def test_find_safe_goal(costmap, input_pos, expected_pos) -> None:
     )
 
     assert safe_goal == Vector3(expected_pos[0], expected_pos[1], 0.0)
+
+
+def test_safe_goal_clearance_uses_metric_radius() -> None:
+    grid = np.zeros((15, 15), dtype=np.int8)
+    grid[7, 13] = CostValues.OCCUPIED
+    costmap = OccupancyGrid(
+        grid=grid,
+        resolution=float(np.float32(0.08)),
+    )
+    goal = costmap.grid_to_world((7, 7))
+
+    safe_goal = find_safe_goal(
+        costmap,
+        goal,
+        algorithm="bfs_contiguous",
+        cost_threshold=CostValues.OCCUPIED,
+        min_clearance=0.4,
+        max_search_distance=1.0,
+        connectivity_check_radius=0,
+    )
+
+    assert safe_goal == goal
+
+
+def test_safe_goal_clearance_includes_float32_radius_boundary() -> None:
+    grid = np.zeros((15, 15), dtype=np.int8)
+    grid[7, 11] = CostValues.OCCUPIED
+    costmap = OccupancyGrid(
+        grid=grid,
+        resolution=float(np.float32(0.05)),
+    )
+    goal = costmap.grid_to_world((7, 7))
+
+    safe_goal = find_safe_goal(
+        costmap,
+        goal,
+        algorithm="bfs_contiguous",
+        cost_threshold=CostValues.OCCUPIED,
+        min_clearance=0.2,
+        max_search_distance=1.0,
+        connectivity_check_radius=0,
+    )
+
+    assert safe_goal != goal
+
+
+def test_contiguous_safe_goal_search_does_not_cross_unknown() -> None:
+    grid = np.full((7, 7), CostValues.UNKNOWN, dtype=np.int8)
+    grid[3, 3] = 60
+    grid[3, 5] = CostValues.FREE
+    costmap = OccupancyGrid(grid=grid, resolution=0.1)
+    goal = costmap.grid_to_world((3, 3))
+
+    safe_goal = find_safe_goal(
+        costmap,
+        goal,
+        algorithm="bfs_contiguous",
+        cost_threshold=50,
+        min_clearance=0.0,
+        max_search_distance=1.0,
+        connectivity_check_radius=0,
+    )
+
+    assert safe_goal is None

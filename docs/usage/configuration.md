@@ -96,7 +96,7 @@ Config(
         rerun_open='native',
         rerun_web=False,
         rerun_host=None,
-        rerun_websocket_server_port=3030,
+        rerun_viewer_input_port=3030,
         n_workers=2,
         memory_limit='auto',
         mujoco_camera_position=None,

@@ -204,11 +204,11 @@
 <polygon fill="#0b0f0f" stroke="#5c9ff0" points="442.07,-52 319.68,-52 319.68,-16 442.07,-16 442.07,-52"/>
 <text xml:space="preserve" text-anchor="middle" x="380.88" y="-28.98" font-family="fixed" font-size="12.00" fill="#b5e4f4">RerunBridgeModule</text>
 </g>
-<!-- RerunWebSocketServer -->
+<!-- RerunViewerInputServer -->
 <g id="node10" class="node">
-<title>RerunWebSocketServer</title>
+<title>RerunViewerInputServer</title>
 <polygon fill="#0b0f0f" stroke="#5c9ff0" points="452.95,-106 308.8,-106 308.8,-70 452.95,-70 452.95,-106"/>
-<text xml:space="preserve" text-anchor="middle" x="380.88" y="-82.97" font-family="fixed" font-size="12.00" fill="#b5e4f4">RerunWebSocketServer</text>
+<text xml:space="preserve" text-anchor="middle" x="380.88" y="-82.97" font-family="fixed" font-size="12.00" fill="#b5e4f4">RerunViewerInputServer</text>
 </g>
 <!-- chan_clicked_point_PointStamped -->
 <g id="node11" class="node">
@@ -218,9 +218,9 @@
 <polyline fill="none" stroke="#ffcc80" points="633.48,-130.15 630.4,-130.15"/>
 <text xml:space="preserve" text-anchor="middle" x="565.52" y="-120.12" font-family="fixed" font-size="10.00" fill="#b5e4f4">clicked_point:PointStamped</text>
 </g>
-<!-- RerunWebSocketServer&#45;&gt;chan_clicked_point_PointStamped -->
+<!-- RerunViewerInputServer&#45;&gt;chan_clicked_point_PointStamped -->
 <g id="edge1" class="edge">
-<title>RerunWebSocketServer&#45;&gt;chan_clicked_point_PointStamped</title>
+<title>RerunViewerInputServer&#45;&gt;chan_clicked_point_PointStamped</title>
 <path fill="none" stroke="#ffcc80" d="M453.28,-102.07C474.09,-106.18 496.35,-110.56 515.45,-114.33"/>
 </g>
 <!-- chan_tele_cmd_vel_Twist -->
@@ -231,9 +231,9 @@
 <polyline fill="none" stroke="#dce775" points="614.73,-94.15 611.65,-94.15"/>
 <text xml:space="preserve" text-anchor="middle" x="565.52" y="-84.12" font-family="fixed" font-size="10.00" fill="#b5e4f4">tele_cmd_vel:Twist</text>
 </g>
-<!-- RerunWebSocketServer&#45;&gt;chan_tele_cmd_vel_Twist -->
+<!-- RerunViewerInputServer&#45;&gt;chan_tele_cmd_vel_Twist -->
 <g id="edge28" class="edge">
-<title>RerunWebSocketServer&#45;&gt;chan_tele_cmd_vel_Twist</title>
+<title>RerunViewerInputServer&#45;&gt;chan_tele_cmd_vel_Twist</title>
 <path fill="none" stroke="#dce775" d="M453.28,-88C474.29,-88 496.78,-88 516,-88"/>
 </g>
 <!-- chan_clicked_point_PointStamped&#45;&gt;MovementManager -->

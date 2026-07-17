@@ -40,7 +40,7 @@ from dimos.navigation.movement_manager.movement_manager import MovementManager
 from dimos.robot.unitree.g1.config import G1_LOCAL_PLANNER_PRECOMPUTED_PATHS
 from dimos.robot.unitree.keyboard_teleop import KeyboardTeleop
 from dimos.visualization.rerun.bridge import RerunBridgeModule
-from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
+from dimos.visualization.rerun.viewer_input_server import RerunViewerInputServer
 
 _base_joints = make_twist_base_joints("base")
 
@@ -170,7 +170,7 @@ coordinator_flowbase_nav = (
             **cmu_nav_rerun_config({"memory_limit": "1GB"}, vis_throttle=0.5),
             rerun_open="native",
         ),
-        RerunWebSocketServer.blueprint(),
+        RerunViewerInputServer.blueprint(),
     )
     .remappings(
         [

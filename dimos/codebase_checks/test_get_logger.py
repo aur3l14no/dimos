@@ -45,7 +45,7 @@ WHITELIST = [
         "lg = logging.getLogger(_ANNOTATION_LOGGER)",
     ),
     (
-        "dimos/visualization/rerun/websocket_server.py",
+        "dimos/visualization/rerun/viewer_input_server.py",
         'ws_logger = logging.getLogger("websockets.server")',
     ),
     (

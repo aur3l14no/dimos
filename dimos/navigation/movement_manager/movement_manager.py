@@ -46,6 +46,7 @@ MAX_CLICK_VERTICAL_M = 50.0
 class MovementManagerConfig(ModuleConfig):
     tele_cooldown_sec: float = 1.0
     tele_cmd_vel_scaling: Twist = Twist(Vector3(1, 1, 1), Vector3(1, 1, 1))
+    publish_way_point: bool = True
 
 
 class MovementManager(Module):
@@ -94,7 +95,8 @@ class MovementManager(Module):
             return
 
         logger.debug("Goal", x=round(msg.x, 1), y=round(msg.y, 1), z=round(msg.z, 1))
-        self.way_point.publish(msg)
+        if self.config.publish_way_point:
+            self.way_point.publish(msg)
         self.goal.publish(msg)
 
     def _cancel_goal(self) -> None:
@@ -105,7 +107,8 @@ class MovementManager(Module):
         cancel = PointStamped(
             ts=time.time(), frame_id="map", x=float("nan"), y=float("nan"), z=float("nan")
         )
-        self.way_point.publish(cancel)
+        if self.config.publish_way_point:
+            self.way_point.publish(cancel)
         self.goal.publish(cancel)
         logger.debug("Navigation cancelled — waiting for new goal")
 

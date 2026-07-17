@@ -30,6 +30,7 @@ class VoxelRayMapper:
         max_health: int = 5,
         graze_cos: float = 0.7,
         support_min: int = 4,
+        local_max_age_frames: int = 0,
     ) -> None: ...
     @property
     def voxel_size(self) -> float: ...

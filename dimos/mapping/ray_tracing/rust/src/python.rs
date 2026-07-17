@@ -83,6 +83,7 @@ impl VoxelRayMapper {
         max_health = 5,
         graze_cos = 0.7,
         support_min = 4,
+        local_max_age_frames = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -95,6 +96,7 @@ impl VoxelRayMapper {
         max_health: i32,
         graze_cos: f32,
         support_min: i32,
+        local_max_age_frames: u32,
     ) -> PyResult<Self> {
         let config = Config {
             require_exact_pose_match: false,
@@ -107,6 +109,7 @@ impl VoxelRayMapper {
             max_health,
             graze_cos,
             support_min,
+            local_max_age_frames,
             emit_every: 1,
             global_emit_every: 1,
             region_percentile: 95.0,
@@ -151,7 +154,7 @@ impl VoxelRayMapper {
         let live = &self.live;
         let positions: Vec<f32> = py.allow_threads(|| {
             let mut out: Vec<f32> = Vec::with_capacity(map.voxels.len() * 3);
-            for (x, y, z) in emit_points(map, voxel_size, None, 0, live) {
+            for (x, y, z) in emit_points(map, voxel_size, None, 0, live, 0) {
                 out.push(x);
                 out.push(y);
                 out.push(z);
@@ -210,11 +213,19 @@ impl VoxelRayMapper {
         };
         let voxel_size = self.config.voxel_size;
         let support_min = self.config.support_min;
+        let max_age_frames = self.config.local_max_age_frames;
         let map = &self.map;
         let live = &self.live;
         let positions: Vec<f32> = py.allow_threads(|| {
             let mut out: Vec<f32> = Vec::new();
-            for (x, y, z) in emit_points(map, voxel_size, Some(&bounds), support_min, live) {
+            for (x, y, z) in emit_points(
+                map,
+                voxel_size,
+                Some(&bounds),
+                support_min,
+                live,
+                max_age_frames,
+            ) {
                 out.push(x);
                 out.push(y);
                 out.push(z);
@@ -232,7 +243,7 @@ impl VoxelRayMapper {
     }
 
     fn clear(&mut self) {
-        self.map.voxels.clear();
+        self.map = VoxelMap::default();
         self.live.clear();
     }
 

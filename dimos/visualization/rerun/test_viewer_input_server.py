@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for RerunWebSocketServer."""
+"""Tests for RerunViewerInputServer."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ import pytest
 import websockets.asyncio.client as ws_client
 
 from dimos.core.global_config import global_config
-from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
+from dimos.visualization.rerun.viewer_input_server import RerunViewerInputServer
 
 _TEST_PORT = 13031
 
@@ -100,27 +100,27 @@ class MockViewerPublisher:
 
 
 @pytest.fixture()
-def server(wait_for_server: Any) -> RerunWebSocketServer:
-    original_port = global_config.rerun_websocket_server_port
-    global_config.update(rerun_websocket_server_port=_TEST_PORT)
+def server(wait_for_server: Any) -> RerunViewerInputServer:
+    original_port = global_config.rerun_viewer_input_port
+    global_config.update(rerun_viewer_input_port=_TEST_PORT)
     try:
-        module = RerunWebSocketServer()
+        module = RerunViewerInputServer()
         module.start()
         wait_for_server(_TEST_PORT)
         yield module  # type: ignore[misc]
         module.stop()
     finally:
-        global_config.update(rerun_websocket_server_port=original_port)
+        global_config.update(rerun_viewer_input_port=original_port)
 
 
 @pytest.fixture()
-def publisher(server: RerunWebSocketServer) -> MockViewerPublisher:
+def publisher(server: RerunViewerInputServer) -> MockViewerPublisher:
     with MockViewerPublisher(f"ws://127.0.0.1:{_TEST_PORT}/ws") as publisher:
         yield publisher  # type: ignore[misc]
 
 
 def test_click_publishes_point_stamped(
-    server: RerunWebSocketServer, publisher: MockViewerPublisher
+    server: RerunViewerInputServer, publisher: MockViewerPublisher
 ) -> None:
     """Click event arrives as PointStamped with correct coords, frame_id, and timestamp."""
     received: list[Any] = []
@@ -143,7 +143,7 @@ def test_click_publishes_point_stamped(
 
 
 def test_twist_publishes_on_tele_cmd_vel(
-    server: RerunWebSocketServer, publisher: MockViewerPublisher
+    server: RerunViewerInputServer, publisher: MockViewerPublisher
 ) -> None:
     """Twist event arrives as Twist on tele_cmd_vel."""
     received: list[Any] = []
@@ -162,7 +162,7 @@ def test_twist_publishes_on_tele_cmd_vel(
 
 
 def test_stop_publishes_zero_twist(
-    server: RerunWebSocketServer, publisher: MockViewerPublisher
+    server: RerunViewerInputServer, publisher: MockViewerPublisher
 ) -> None:
     """Stop event publishes a zero Twist on tele_cmd_vel."""
     received: list[Any] = []
@@ -179,7 +179,7 @@ def test_stop_publishes_zero_twist(
     assert received[0].is_zero()
 
 
-def test_invalid_json_does_not_crash(server: RerunWebSocketServer) -> None:
+def test_invalid_json_does_not_crash(server: RerunViewerInputServer) -> None:
     """Malformed JSON is silently dropped; server stays alive for the next message."""
 
     async def _send_bad() -> None:
@@ -193,7 +193,7 @@ def test_invalid_json_does_not_crash(server: RerunWebSocketServer) -> None:
 
 
 def test_mixed_message_sequence(
-    server: RerunWebSocketServer, publisher: MockViewerPublisher
+    server: RerunViewerInputServer, publisher: MockViewerPublisher
 ) -> None:
     """Realistic session: heartbeat, click, twist, stop — only the click produces a point."""
     received: list[Any] = []

@@ -19,19 +19,22 @@ from typing import Any, get_args
 
 from dimos.core.coordination.blueprints import Blueprint, autoconnect
 from dimos.visualization.rerun.constants import ViewerBackend
-from dimos.visualization.rerun.websocket_server import RerunWebSocketServer
+from dimos.visualization.rerun.viewer_input_server import RerunViewerInputServer
 from dimos.web.websocket_vis.websocket_vis_module import WebsocketVisModule
 
 
 def vis_module(
     viewer_backend: ViewerBackend,
     rerun_config: dict[str, Any] | None = None,
+    *,
+    viewer_controls: bool = True,
+    web_dashboard: bool = True,
 ) -> Blueprint:
     """Create a visualization blueprint based on the selected viewer backend.
 
-    Bundles the Rerun viewer module together with
-    the ``WebsocketVisModule`` and ``RerunWebSocketServer`` so that the web
-    dashboard and remote viewer connections work out of the box.
+    By default, bundles the Rerun viewer module with the viewer-control server
+    and legacy web dashboard. Products that do not use those optional services
+    can omit them without disabling Rerun visualization.
 
     Example usage::
 
@@ -61,15 +64,16 @@ def vis_module(
             rerun_config.setdefault("pubsubs", [LCM()])
             rerun_config.setdefault("rerun_open", global_config.rerun_open)
             rerun_config.setdefault("rerun_web", global_config.rerun_web)
-            return autoconnect(
-                RerunBridgeModule.blueprint(
-                    **rerun_config,
-                ),
-                RerunWebSocketServer.blueprint(),
-                WebsocketVisModule.blueprint(),
-            )
+            modules = [RerunBridgeModule.blueprint(**rerun_config)]
+            if viewer_controls:
+                modules.append(RerunViewerInputServer.blueprint())
+            if web_dashboard:
+                modules.append(WebsocketVisModule.blueprint())
+            return autoconnect(*modules)
         case "none":
-            return autoconnect(WebsocketVisModule.blueprint())
+            if web_dashboard:
+                return autoconnect(WebsocketVisModule.blueprint())
+            return autoconnect()
         case _:
             valid = ", ".join(get_args(ViewerBackend))
             raise ValueError(f"Unknown viewer_backend {viewer_backend!r}. Expected one of: {valid}")

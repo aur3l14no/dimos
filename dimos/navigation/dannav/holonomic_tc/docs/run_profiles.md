@@ -3,7 +3,7 @@
 ## Purpose
 
 Named movement envelopes (`walk`, `trot`, `run_conservative`) bundle
-cruise speed and limit caps in one registry entry. `DanHolonomicTC` is the only live
+cruise speed and limit caps in one registry entry. `HolonomicPathFollower` is the only live
 consumer: it resolves a profile name into path-speed limits and command saturation
 limits on each follow.
 
@@ -17,11 +17,11 @@ name at deploy time.
 
 | Surface                               | How you set the profile                                                     | Status                                                   | Code                                                                                                              |
 | ------------------------------------- | --------------------------------------------------------------------------- | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| Blueprint                             | `DanHolonomicTC.blueprint(run_profile="walk")` on the `autoconnect` chain   | Wired at deploy                                          | e.g. `unitree_go2_mls_htc.py`                                                                                     |
-| CLI                                   | `dimos run <blueprint> -o danholonomictc.run_profile=trot`                  | Wired at deploy                                          | `dimos/robot/cli/dimos.py` (`load_config_args` -> module `config`)                                                |
-| Module default                        | Omit `run_profile`; `DanHolonomicTCConfig` defaults to `"walk"`             | Wired                                                    | `module.py` (`DanHolonomicTCConfig.run_profile`)                                                                  |
-| Live RPC                              | `DanHolonomicTC.set_run_profile("trot")` on a running module                | Wired in module; no production caller yet                | `module.py` (`set_run_profile` RPC -> `_HolonomicPathFollower.set_run_profile`)                                   |
-| Cruise override                       | `DanHolonomicTC.blueprint(speed_m_s=1.0)` or `danholonomictc.speed_m_s=1.0` | Wired; overrides profile cruise only, not accel/yaw caps | `module.py` (`_cruise_speed_override` in `_profile_run_envelope`)                                                 |
+| Blueprint                             | `HolonomicPathFollower.blueprint(run_profile="walk")` on the `autoconnect` chain   | Wired at deploy                                          | e.g. `unitree_go2_mls_htc.py`                                                                                     |
+| CLI                                   | `dimos run <blueprint> -o holonomicpathfollower.run_profile=trot`                  | Wired at deploy                                          | `dimos/robot/cli/dimos.py` (`load_config_args` -> module `config`)                                                |
+| Module default                        | Omit `run_profile`; `HolonomicPathFollowerConfig` defaults to `"walk"`             | Wired                                                    | `path_follower.py` (`HolonomicPathFollowerConfig.run_profile`)                                                                  |
+| Live RPC                              | `HolonomicPathFollower.set_run_profile("trot")` on a running module                | Wired in module; no production caller yet                | `path_follower.py` (`set_run_profile` RPC -> `_HolonomicPathFollowerCore.set_run_profile`)                                   |
+| Cruise override                       | `HolonomicPathFollower.blueprint(speed_m_s=1.0)` or `holonomicpathfollower.speed_m_s=1.0` | Wired; overrides profile cruise only, not accel/yaw caps | `path_follower.py` (`_cruise_speed_override` in `_profile_run_envelope`)                                                 |
 | Agent skills (`relative_move`, etc.)  | N/A                                                                         | Not wired to run profiles                                | Skills use `NavigationInterface`; MLS+HTC stack uses click goals via `MovementManager`                            |
 | MCP tools                             | N/A                                                                         | Not wired to run profiles                                | No MCP tool calls `set_run_profile`                                                                               |
 | `GO2_RUN_PROFILE` env var             | N/A                                                                         | Removed                                                  | Was `GlobalConfig.go2_run_profile`; use blueprint / CLI module config instead                                     |
@@ -32,8 +32,8 @@ name at deploy time.
 
 ### Limit flow (when wired)
 
-1. `DanHolonomicTCConfig.run_profile` names a registry entry.
-2. `_HolonomicPathFollower._resolve_run_envelope()` calls `GO2_RUN_PROFILES.get(name)`.
+1. `HolonomicPathFollowerConfig.run_profile` names a registry entry.
+2. `_HolonomicPathFollowerCore._resolve_run_envelope()` calls `GO2_RUN_PROFILES.get(name)`.
 3. `_apply_run_envelope()` sets path-speed limits and passes the `RunProfile` into
   `HolonomicPathController` (`set_profile`, `set_speed`).
 4. Each control tick: path reference speed from the profile's path limits; `cmd_vel`
@@ -78,8 +78,8 @@ Adapter onto the existing validated limit type:
 `GO2_RUN_PROFILES.get(name)` looks up a profile by name. Unknown names raise
 `RunProfileError` with a message listing known profiles.
 
-The session profile is `DanHolonomicTCConfig.run_profile`, resolved in
-`_HolonomicPathFollower._resolve_run_envelope` at module construction. The
+The session profile is `HolonomicPathFollowerConfig.run_profile`, resolved in
+`_HolonomicPathFollowerCore._resolve_run_envelope` at module construction. The
 `set_run_profile` RPC re-resolves and applies a new profile live. The registry is
 the single envelope source: even `walk` reads its caps from `GO2_RUN_PROFILES`,
 not from removed `GlobalConfig.local_planner_*` fields.
@@ -100,11 +100,11 @@ performance**.
 Example blueprint line:
 
 ```python
-DanHolonomicTC.blueprint(run_profile="walk"),
+HolonomicPathFollower.blueprint(run_profile="walk"),
 ```
 
 Example CLI override:
 
 ```bash
-dimos run unitree-go2-mls-htc -o danholonomictc.run_profile=trot
+dimos run unitree-go2-mls-htc -o holonomicpathfollower.run_profile=trot
 ```
