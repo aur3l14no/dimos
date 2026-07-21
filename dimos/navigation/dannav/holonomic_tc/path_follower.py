@@ -123,6 +123,8 @@ class _HolonomicPathFollowerCore:
     _orientation_tolerance: float
     _align_heading_before_move: bool
     _align_goal_yaw: bool
+    _allow_in_place_rotation: bool
+    _goal_yaw_blend_distance_m: float
 
     def __init__(self, config: HolonomicPathFollowerConfig) -> None:
         self.cmd_vel = Subject()
@@ -138,6 +140,13 @@ class _HolonomicPathFollowerCore:
         self._control_frequency = float(config.control_frequency)
         self._align_heading_before_move = bool(config.align_heading_before_move)
         self._align_goal_yaw = bool(config.align_goal_yaw)
+        self._allow_in_place_rotation = bool(config.allow_in_place_rotation)
+        self._goal_yaw_blend_distance_m = float(config.goal_yaw_blend_distance_m)
+        if (
+            not math.isfinite(self._goal_yaw_blend_distance_m)
+            or self._goal_yaw_blend_distance_m <= 0.0
+        ):
+            raise ValueError("goal_yaw_blend_distance_m must be a positive finite float")
         self._run_profile = config.run_profile
         self._previous_odom_for_velocity = None
         self._path_speed_profile_s = None
@@ -326,7 +335,12 @@ class _HolonomicPathFollowerCore:
         first only when ``align_heading_before_move`` is set and the start is
         misaligned with the first path tangent.
         """
-        if not self._align_heading_before_move or current_odom is None or len(path.poses) == 0:
+        if (
+            not self._align_heading_before_move
+            or not self._allow_in_place_rotation
+            or current_odom is None
+            or len(path.poses) == 0
+        ):
             return "path_following"
 
         first_yaw = path.poses[0].orientation.euler[2]
@@ -402,9 +416,11 @@ class _HolonomicPathFollowerCore:
 
     def _compute_path_following(self) -> Twist:
         with self._lock:
+            path = self._path
             path_distancer = self._path_distancer
             current_odom = self._current_odom
 
+        assert path is not None
         assert path_distancer is not None
         assert current_odom is not None
 
@@ -412,14 +428,25 @@ class _HolonomicPathFollowerCore:
 
         if path_distancer.distance_to_goal(current_pos) < self._goal_tolerance:
             if self._align_goal_yaw:
-                logger.info("Reached goal position, starting final rotation")
+                goal_yaw = path.poses[-1].orientation.euler[2]
+                robot_yaw = current_odom.orientation.euler[2]
+                yaw_error = angle_diff(goal_yaw, robot_yaw)
+                if abs(yaw_error) >= self._orientation_tolerance:
+                    if self._allow_in_place_rotation:
+                        logger.info("Reached goal position, starting final rotation")
+                        with self._lock:
+                            self._change_state("final_rotation")
+                        return self._compute_final_rotation()
+                else:
+                    logger.info("Reached goal pose")
+                    with self._lock:
+                        self._change_state("arrived")
+                    return Twist()
+            else:
+                logger.info("Reached goal position")
                 with self._lock:
-                    self._change_state("final_rotation")
-                return self._compute_final_rotation()
-            logger.info("Reached goal position")
-            with self._lock:
-                self._change_state("arrived")
-            return Twist()
+                    self._change_state("arrived")
+                return Twist()
 
         path_speed = self._path_speed_at_position(path_distancer, current_pos)
         self._controller.set_speed(path_speed)
@@ -428,6 +455,7 @@ class _HolonomicPathFollowerCore:
             current_odom,
             current_pos,
             path_speed,
+            float(path.poses[-1].orientation.euler[2]),
         )
         measured_body_twist = self._estimate_measured_body_twist(current_odom)
         return self._controller.advance_reference(
@@ -442,6 +470,7 @@ class _HolonomicPathFollowerCore:
         current_odom: PoseStamped,
         current_pos: np.ndarray,
         path_speed: float,
+        goal_yaw: float,
     ) -> TrajectoryReferenceSample:
         projection = path_distancer.project(current_pos)
         s_start = float(projection.s_along_path_m)
@@ -460,6 +489,7 @@ class _HolonomicPathFollowerCore:
             s_end,
             now_s + duration_s,
             path_speed,
+            goal_yaw,
         )
 
     def _reference_sample_at_progress(
@@ -468,18 +498,38 @@ class _HolonomicPathFollowerCore:
         progress_m: float,
         time_s: float,
         path_speed: float,
+        goal_yaw: float,
     ) -> TrajectoryReferenceSample:
         point = path_distancer.point_at_progress(progress_m)
-        # Body yaw tracks the path tangent; the holonomic law translates toward
-        # the reference while turning. No costmap yaw-lock in this stack.
-        path_yaw = path_distancer.yaw_at_progress(progress_m)
+        path_tangent_yaw = path_distancer.yaw_at_progress(progress_m)
+        body_yaw = path_tangent_yaw
+        if self._align_goal_yaw and not self._allow_in_place_rotation:
+            remaining_m = max(0.0, path_distancer.path_length_m - progress_m)
+            blend_span_m = max(
+                1e-6,
+                self._goal_yaw_blend_distance_m - self._goal_tolerance,
+            )
+            blend = (self._goal_yaw_blend_distance_m - remaining_m) / blend_span_m
+            blend = min(1.0, max(0.0, blend))
+            blend = blend * blend * (3.0 - 2.0 * blend)
+            body_yaw += blend * angle_diff(goal_yaw, body_yaw)
+
+        # The body may turn away from the path tangent while still translating
+        # along the path. Express that world-frame tangent velocity in the
+        # planned body frame before the tracking controller rotates it into the
+        # measured body frame.
+        tangent_in_body = angle_diff(path_tangent_yaw, body_yaw)
         feedforward = Twist(
-            linear=Vector3(path_speed, 0.0, 0.0),
+            linear=Vector3(
+                path_speed * math.cos(tangent_in_body),
+                path_speed * math.sin(tangent_in_body),
+                0.0,
+            ),
             angular=Vector3(0.0, 0.0, 0.0),
         )
         return TrajectoryReferenceSample(
             time_s=time_s,
-            pose_plan=_pose_from_xy_yaw(float(point[0]), float(point[1]), path_yaw),
+            pose_plan=_pose_from_xy_yaw(float(point[0]), float(point[1]), body_yaw),
             twist_body=feedforward,
         )
 
@@ -598,6 +648,8 @@ class HolonomicPathFollowerConfig(ModuleConfig):
     k_yaw_rate_per_s: float = 1.0
     align_heading_before_move: bool = False
     align_goal_yaw: bool = False
+    allow_in_place_rotation: bool = True
+    goal_yaw_blend_distance_m: float = 1.0
 
 
 class HolonomicPathFollower(Module):

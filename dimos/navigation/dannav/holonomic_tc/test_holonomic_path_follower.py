@@ -37,6 +37,7 @@ from dimos.navigation.dannav.holonomic_tc.path_follower import (
     _HolonomicPathFollowerCore,
 )
 from dimos.navigation.dannav.holonomic_tc.run_profiles import RunProfile
+from dimos.utils.trigonometry import angle_diff
 
 
 def _planar_speed_m_s(cmd: Twist) -> float:
@@ -118,6 +119,7 @@ def _run_follower(
     *,
     points: list[tuple[float, float]],
     initial_yaw_rad: float = 0.0,
+    goal_yaw_rad: float | None = None,
     max_ticks: int = 300,
     rate_hz: float = 60.0,
 ) -> _RunResult:
@@ -138,7 +140,10 @@ def _run_follower(
 
     try:
         core.handle_odom(_pose_stamped(plant_x_m, plant_y_m, plant_yaw_rad, ts=sim_time_s))
-        core.start_following(_path_from_points(points))
+        path = _path_from_points(points)
+        if goal_yaw_rad is not None:
+            path.poses[-1].orientation = _yaw_quaternion(goal_yaw_rad)
+        core.start_following(path)
         for _ in range(max_ticks):
             if "arrived" in stop_messages:
                 break
@@ -224,3 +229,27 @@ def test_closed_loop_rotate_first_then_arrives() -> None:
         for cmd in result.command_history[:20]
     )
     assert abs(result.final_yaw_rad) < 0.35
+
+
+def test_closed_loop_blends_goal_yaw_without_in_place_rotation() -> None:
+    goal_yaw_rad = math.pi / 2.0
+    result = _run_follower(
+        _make_follower(
+            speed_m_s=0.3,
+            control_frequency=60.0,
+            goal_tolerance=0.08,
+            orientation_tolerance=0.35,
+            align_goal_yaw=True,
+            allow_in_place_rotation=False,
+            goal_yaw_blend_distance_m=1.0,
+        ),
+        points=[(0.1, 0.0), (1.5, 0.0)],
+        goal_yaw_rad=goal_yaw_rad,
+        max_ticks=500,
+    )
+    turning_commands = [cmd for cmd in result.command_history if abs(float(cmd.angular.z)) > 0.05]
+
+    assert "arrived" in result.stop_messages
+    assert abs(angle_diff(result.final_yaw_rad, goal_yaw_rad)) < 0.35
+    assert turning_commands
+    assert all(_planar_speed_m_s(cmd) > 0.01 for cmd in turning_commands)
