@@ -47,6 +47,9 @@
           root = ./.;
           fileset = craneLib.fileset.commonCargoSources ./.;
         };
+        wheelDistribution = "dimos_voxel_ray_tracing";
+        wheelTag =
+          "cp310-abi3-linux_${pkgs.stdenv.hostPlatform.uname.processor}";
 
         commonArgs = {
           pname = "voxel-ray-tracing";
@@ -55,6 +58,8 @@
 
           cargoLock = ./Cargo.lock;
           cargoToml = ./Cargo.toml;
+          env.PYO3_PYTHON = python.interpreter;
+          nativeBuildInputs = [ python ];
           RUSTFLAGS = pkgs.lib.optionalString pkgs.stdenv.isDarwin (
             "-C link-arg=-undefined -C link-arg=dynamic_lookup"
           );
@@ -66,7 +71,7 @@
         };
 
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-        package = craneLib.buildPackage (
+        nativePackage = craneLib.buildPackage (
           commonArgs
           // {
             inherit cargoArtifacts;
@@ -82,6 +87,43 @@
             meta.mainProgram = "voxel_ray_tracing";
           }
         );
+        wheelMetadata = pkgs.writeText "METADATA" ''
+          Metadata-Version: 2.4
+          Name: dimos-voxel-ray-tracing
+          Version: ${commonArgs.version}
+          Summary: Native Rust voxel-map module with raycast clearing for DimOS
+          License-Expression: Apache-2.0
+          Requires-Python: >=3.10
+        '';
+        wheelDescriptor = pkgs.writeText "WHEEL" ''
+          Wheel-Version: 1.0
+          Generator: Nix
+          Root-Is-Purelib: false
+          Tag: ${wheelTag}
+        '';
+        pythonWheel =
+          assert pkgs.stdenv.hostPlatform.isLinux;
+          pkgs.runCommand "dimos-voxel-ray-tracing-wheel-${commonArgs.version}"
+            {
+              nativeBuildInputs = [ python.pkgs.wheel ];
+            }
+            ''
+              wheelRoot="$(mktemp -d)"
+              distInfo="$wheelRoot/${wheelDistribution}-${commonArgs.version}.dist-info"
+              mkdir -p "$distInfo" "$out/wheels" "$out/nix-support"
+              cp \
+                "${nativePackage}/${python.sitePackages}/dimos_voxel_ray_tracing.abi3.so" \
+                "$wheelRoot/"
+              cp "${wheelMetadata}" "$distInfo/METADATA"
+              cp "${wheelDescriptor}" "$distInfo/WHEEL"
+              wheel pack "$wheelRoot" --dest-dir "$out/wheels"
+              ln -s "${nativePackage}" "$out/nix-support/native-package"
+            '';
+        package = pkgs.symlinkJoin {
+          name = "voxel-ray-tracing-${commonArgs.version}";
+          paths = [ nativePackage ] ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pythonWheel;
+          meta.mainProgram = "voxel_ray_tracing";
+        };
         tests = craneLib.cargoTest (
           commonArgs
           // {
@@ -90,7 +132,14 @@
         );
       in
       {
-        packages.default = package;
+        packages =
+          {
+            default = package;
+            native = nativePackage;
+          }
+          // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            python-wheel = pythonWheel;
+          };
         checks = {
           build = package;
           inherit tests;
