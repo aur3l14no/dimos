@@ -39,15 +39,22 @@ def _height_map_kernel(
     width: int,
     height: int,
 ) -> None:
-    """Build min/max height maps from points (faster than np.fmax/fmin.at)."""
+    """Build min/max height maps from points (faster than np.fmax/fmin.at).
+
+    OccupancyGrid origins describe the lower-left corner of cell (0, 0).
+    Cell (gx, gy) contains points in these half-open intervals:
+    min_x + gx / inv_res <= x < min_x + (gx + 1) / inv_res
+    min_y + gy / inv_res <= y < min_y + (gy + 1) / inv_res
+    The lower bounds are included and the upper bounds are excluded.
+    """
     n = points.shape[0]
     for i in range(n):
         x = points[i, 0]
         y = points[i, 1]
         z = points[i, 2]
 
-        gx = int((x - min_x) * inv_res + 0.5)
-        gy = int((y - min_y) * inv_res + 0.5)
+        gx = int(np.floor((x - min_x) * inv_res))
+        gy = int(np.floor((y - min_y) * inv_res))
 
         if 0 <= gx < width and 0 <= gy < height:
             cur_min = min_height_map[gy, gx]
@@ -79,8 +86,8 @@ def _simple_occupancy_kernel(
         y = points[i, 1]
         z = points[i, 2]
         if z < min_height:
-            gx = int((x - min_x) * inv_res + 0.5)
-            gy = int((y - min_y) * inv_res + 0.5)
+            gx = int(np.floor((x - min_x) * inv_res))
+            gy = int(np.floor((y - min_y) * inv_res))
             if 0 <= gx < width and 0 <= gy < height:
                 grid[gy, gx] = 0
 
@@ -90,8 +97,8 @@ def _simple_occupancy_kernel(
         y = points[i, 1]
         z = points[i, 2]
         if min_height <= z <= max_height:
-            gx = int((x - min_x) * inv_res + 0.5)
-            gy = int((y - min_y) * inv_res + 0.5)
+            gx = int(np.floor((x - min_x) * inv_res))
+            gy = int(np.floor((y - min_y) * inv_res))
             if 0 <= gx < width and 0 <= gy < height:
                 grid[gy, gx] = 100
 
