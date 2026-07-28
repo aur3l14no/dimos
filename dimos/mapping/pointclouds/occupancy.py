@@ -41,8 +41,11 @@ def _height_map_kernel(
 ) -> None:
     """Build min/max height maps from points (faster than np.fmax/fmin.at).
 
-    OccupancyGrid origins describe the corner of cell (0, 0), so points are
-    assigned to the half-open cell interval containing them.
+    OccupancyGrid origins describe the lower-left corner of cell (0, 0).
+    Cell (gx, gy) contains points in these half-open intervals:
+    min_x + gx / inv_res <= x < min_x + (gx + 1) / inv_res
+    min_y + gy / inv_res <= y < min_y + (gy + 1) / inv_res
+    The lower bounds are included and the upper bounds are excluded.
     """
     n = points.shape[0]
     for i in range(n):
