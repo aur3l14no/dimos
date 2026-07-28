@@ -150,3 +150,58 @@ def test_height_cost_smoothing_does_not_observe_interpolated_cells() -> None:
 
     np.testing.assert_array_equal(costmap.grid >= 0, directly_observed)
     assert np.all(costmap.grid[directly_observed] > 0)
+
+
+def test_height_cost_gradient_context_only_changes_direct_costs() -> None:
+    obstacle = np.array(
+        [[x, y, 0.08] for y in (-0.08, 0.0, 0.08) for x in (0.0, 0.08, 0.16)],
+        dtype=np.float32,
+    )
+    ground_context = np.array(
+        [[x, y, 0.0] for y in (-0.16, -0.08, 0.0, 0.08, 0.16) for x in (-0.16, -0.08)],
+        dtype=np.float32,
+    )
+    cloud = PointCloud2.from_numpy(obstacle, frame_id="map")
+    config = {
+        "resolution": 0.08,
+        "smoothing": 1.0,
+        "ignore_noise": 0.03,
+        "can_climb": 0.07,
+    }
+
+    without_context = height_cost_occupancy(cloud, **config)
+    with_context = height_cost_occupancy(
+        cloud,
+        gradient_context_points=ground_context,
+        **config,
+    )
+
+    assert with_context.grid.shape == without_context.grid.shape
+    assert with_context.origin == without_context.origin
+    np.testing.assert_array_equal(with_context.grid >= 0, without_context.grid >= 0)
+    assert without_context.grid.max() == 0
+    assert with_context.grid.max() >= 50
+
+
+def test_height_cost_direct_observation_wins_over_context() -> None:
+    points = np.array(
+        [[x, y, 0.2 * x] for y in (0.0, 0.5, 1.0) for x in (0.0, 0.5, 1.0)],
+        dtype=np.float32,
+    )
+    cloud = PointCloud2.from_numpy(points, frame_id="map")
+    config = {
+        "resolution": 0.5,
+        "smoothing": 1.0,
+        "ignore_noise": 0.01,
+        "can_climb": 0.15,
+    }
+
+    without_context = height_cost_occupancy(cloud, **config)
+    with_context = height_cost_occupancy(
+        cloud,
+        gradient_context_points=points + np.array([0.0, 0.0, 1.0]),
+        **config,
+    )
+
+    np.testing.assert_array_equal(with_context.grid, without_context.grid)
+    assert with_context.origin == without_context.origin

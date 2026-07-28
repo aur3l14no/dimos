@@ -140,7 +140,12 @@ class HeightCostConfig(OccupancyConfig):
     smoothing: float = 1.0
 
 
-def height_cost_occupancy(cloud: PointCloud2, **kwargs: Any) -> OccupancyGrid:
+def height_cost_occupancy(
+    cloud: PointCloud2,
+    *,
+    gradient_context_points: NDArray[np.floating[Any]] | None = None,
+    **kwargs: Any,
+) -> OccupancyGrid:
     """Create a costmap based on terrain slope (rate of change of height).
 
     Costs are assigned based on the gradient magnitude of the terrain height.
@@ -149,6 +154,9 @@ def height_cost_occupancy(cloud: PointCloud2, **kwargs: Any) -> OccupancyGrid:
 
     Args:
         cloud: PointCloud2 message containing 3D points
+        gradient_context_points: Optional points used only as neighborhood
+            context for gradients. They never make cells observed in the
+            returned grid and never override cloud observations.
         **kwargs: HeightCostConfig fields - resolution, can_pass_under, can_climb,
                   ignore_noise, smoothing, frame_id
 
@@ -168,7 +176,16 @@ def height_cost_occupancy(cloud: PointCloud2, **kwargs: Any) -> OccupancyGrid:
             frame_id=cfg.frame_id or cloud.frame_id,
         )
 
-    # Find bounds of the point cloud in X-Y plane (use all points)
+    context_points = np.empty((0, 3), dtype=np.float64)
+    if gradient_context_points is not None:
+        context_points = np.asarray(gradient_context_points, dtype=np.float64)
+        if context_points.ndim != 2 or context_points.shape[1] < 3:
+            raise ValueError("gradient_context_points must have shape (N, 3+)")
+        context_points = context_points[:, :3]
+        context_points = context_points[np.all(np.isfinite(context_points), axis=1)]
+
+    # Context must not move or resize the direct cloud's grid. Out-of-bounds
+    # context points are simply ignored by the projection kernel below.
     min_x = np.min(points[:, 0])
     max_x = np.max(points[:, 0])
     min_y = np.min(points[:, 1])
@@ -218,14 +235,31 @@ def height_cost_occupancy(cloud: PointCloud2, **kwargs: Any) -> OccupancyGrid:
     # Keep direct observations separate from interpolated gradient context. Only
     # cells backed by point-cloud samples may be emitted as observed costs.
     direct_observed_mask = ~np.isnan(height_map)
-    gradient_context_mask = direct_observed_mask
+    gradient_context_mask = direct_observed_mask.copy()
+
+    if len(context_points) > 0:
+        context_height_map = np.full((height, width), np.nan, dtype=np.float32)
+        context_max_height_map = np.full((height, width), np.nan, dtype=np.float32)
+        _height_map_kernel(
+            context_points,
+            context_height_map,
+            context_max_height_map,
+            min_x,
+            min_y,
+            1.0 / cfg.resolution,
+            width,
+            height,
+        )
+        context_mask = ~np.isnan(context_height_map)
+        height_map = np.where(direct_observed_mask, height_map, context_height_map)
+        gradient_context_mask |= context_mask
 
     # Step 3: Apply smoothing to fill gaps while preserving unknown space
-    if cfg.smoothing > 0 and np.any(direct_observed_mask):
+    if cfg.smoothing > 0 and np.any(gradient_context_mask):
         # Use a weighted smoothing approach that only interpolates from known cells
         # Create a weight map (1 for observed, 0 for unknown)
-        weights = direct_observed_mask.astype(np.float32)
-        height_map_filled = np.where(direct_observed_mask, height_map, 0.0)
+        weights = gradient_context_mask.astype(np.float32)
+        height_map_filled = np.where(gradient_context_mask, height_map, 0.0)
 
         # Smooth both height values and weights
         smoothed_heights = ndimage.gaussian_filter(height_map_filled, sigma=cfg.smoothing)
@@ -236,8 +270,8 @@ def height_cost_occupancy(cloud: PointCloud2, **kwargs: Any) -> OccupancyGrid:
         height_map_smoothed = np.full_like(smoothed_heights, np.nan)
         np.divide(smoothed_heights, smoothed_weights, out=height_map_smoothed, where=valid_smooth)
 
-        # Keep original values where we had observations, use smoothed elsewhere
-        height_map = np.where(direct_observed_mask, height_map, height_map_smoothed)
+        # Keep observed and explicit context values, use smoothing only in gaps.
+        height_map = np.where(gradient_context_mask, height_map, height_map_smoothed)
 
         # Interpolated cells provide neighborhood context for gradient calculation,
         # but remain unknown in the returned occupancy grid.
